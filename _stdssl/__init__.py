@@ -1,5 +1,3 @@
-
-
 from _openssl import ffi
 from _openssl import lib
 
@@ -15,24 +13,32 @@ version_info = (major, minor, fix, patch, status)
 OPENSSL_VERSION_INFO = version_info
 del ver, version_info, status, patch, fix, minor, major
 
-
 HAS_ECDH = bool(lib.Cryptography_HAS_ECDH)
 HAS_SNI = bool(lib.Cryptography_HAS_TLSEXT_HOSTNAME)
 HAS_ALPN = bool(lib.Cryptography_HAS_ALPN)
 HAS_NPN = False
+_HAS_TLS_UNIQUE = True
 
-OP_ALL = lib.SSL_OP_ALL
+CLIENT = 0
+SERVER = 1
 
-def ssl_error(msg, errno, errtype, errcode):
+CERT_NONE = 0
+CERT_OPTIONAL = 1
+CERT_REQUIRED = 2
+
+for name in dir(lib):
+    if name.startswith('SSL_OP'):
+        globals()[name[4:]] = getattr(lib, name)
+
+def ssl_error(msg, errno=0, errtype=None, errcode=0):
     reason_str = None
     lib_str = None
-    # TODO
     if errcode:
-        err_lib = libssl_ERR_GET_LIB(errcode)
-        err_reason = libssl_ERR_GET_REASON(errcode)
+        err_lib = lib.ERR_GET_LIB(errcode)
+        err_reason = lib.ERR_GET_REASON(errcode)
         reason_str = ERROR_CODES_TO_NAMES.get((err_lib, err_reason), None)
         lib_str = LIBRARY_CODES_TO_NAMES.get(err_lib, None)
-        msg = rffi.charp2str(libssl_ERR_reason_error_string(errcode))
+        msg = rffi.charp2str(lib.ERR_reason_error_string(errcode))
     if not msg:
         msg = "unknown error"
     if reason_str and lib_str:
@@ -40,6 +46,7 @@ def ssl_error(msg, errno, errtype, errcode):
     elif lib_str:
         msg = "[%s] %s" % (lib_str, msg)
 
+    raise Exception(msg)
     w_exception_class = w_errtype or get_error(space).w_error
     if errno or errcode:
         w_exception = space.call_function(w_exception_class,
@@ -52,33 +59,35 @@ def ssl_error(msg, errno, errtype, errcode):
                   space.wrap(lib_str) if lib_str else space.w_None)
     return OperationError(w_exception_class, w_exception)
 
-PROTOCOL_TLS = 0
-PROTOCOL_SSLv23 = PROTOCOL_TLS
-if lib.Cryptography_HAS_SSL2:
-    PROTOCOL_SSLv2 = 1
-if lib.Cryptography_HAS_SSL3_METHOD:
-    PROTOCOL_SSLv3 = 2
-PROTOCOL_TLS1 = 3
-PROTOCOL_TLS1_1 = 4
-PROTOCOL_TLS1_2 = 5
+PROTOCOL_SSLv2  = 0
+PROTOCOL_SSLv3  = 1
+PROTOCOL_SSLv23 = 2
+PROTOCOL_TLSv1    = 3
+if lib.Cryptography_HAS_TLSv1_2:
+    PROTOCOL_TLSv1 = 3
+    PROTOCOL_TLSv1_1 = 4
+    PROTOCOL_TLSv1_2 = 5
 
 _PROTOCOL_NAMES = (name for name in dir(lib) if name.startswith('PROTOCOL_'))
 
-HAS_SNI = False
+from enum import Enum as _Enum, IntEnum as _IntEnum
+_IntEnum._convert('_SSLMethod', __name__,
+        lambda name: name.startswith('PROTOCOL_'))
 
-# TODO
-#if lib.HAS_TLS_UNIQUE:
-CHANNEL_BINDING_TYPES = ['tls-unique']
-#else:
-#    CHANNEL_BINDING_TYPES = []
+if _HAS_TLS_UNIQUE:
+    CHANNEL_BINDING_TYPES = ['tls-unique']
+else:
+    CHANNEL_BINDING_TYPES = []
 
 class SSLContext(object):
-    ctx = None
+    ctx = ffi.NULL
 
-    def __init__(self, space, protocol):
-        if protocol == PROTOCOL_TLS1_1:
+    def __init__(self, protocol):
+        if protocol == PROTOCOL_TLSv1:
+            method = lib.TLSv1_method()
+        elif lib.Cryptography_HAS_TLSv1_2 and protocol == PROTOCOL_TLSv1_1:
             method = lib.TLSv1_1_method()
-        elif protocol == PROTOCOL_TLS1_2:
+        elif lib.Cryptography_HAS_TLSv1_2 and protocol == PROTOCOL_TLSv1_2 :
             method = lib.TLSv1_2_method()
         elif protocol == PROTOCOL_SSLv3 and lib.Cryptography_HAS_SSL3_METHOD:
             method = lib.SSLv3_method()
@@ -86,19 +95,15 @@ class SSLContext(object):
             method = lib.SSLv2_method()
         elif protocol == PROTOCOL_SSLv23:
             method = lib.SSLv23_method()
-        elif protocol == PROTOCOL_TLS1_1 and lib.Cryptography_HAS_TLSv1_1:
-            method = lib.TLSv1_1_method()
-        elif protocol == PROTOCOL_TLS1_2 and lib.Cryptography_HAS_TLSv1_2:
-            method = lib.TLSv1_2_method()
         else:
             raise ValueError("invalid protocol version")
 
         self.ctx = lib.SSL_CTX_new(method)
-        if not self.ctx:
+        if self.ctx is ffi.NULL:
             raise ssl_error("failed to allocate SSL context")
 
         self.check_hostname = False
-        self.register_finalizer(space)
+        # TODO self.register_finalizer(space)
 
         # Defaults
         lib.SSL_CTX_set_verify(self.ctx, lib.SSL_VERIFY_NONE, None)
@@ -110,21 +115,22 @@ class SSLContext(object):
         lib.SSL_CTX_set_options(self.ctx, options)
         lib.SSL_CTX_set_session_id_context(self.ctx, b"Python", len(b"Python"))
 
-        #if not OPENSSL_NO_ECDH:
-        #    # Allow automatic ECDH curve selection (on
-        #    # OpenSSL 1.0.2+), or use prime256v1 by default.
-        #    # This is Apache mod_ssl's initialization
-        #    # policy, so we should be safe.
-        #    if libssl_SSL_CTX_set_ecdh_auto:
-        #        libssl_SSL_CTX_set_ecdh_auto(self.ctx, 1)
-        #    else:
-        #        key = libssl_EC_KEY_new_by_curve_name(NID_X9_62_prime256v1)
-        #        if not key:
-        #            raise _ssl_seterror(space, None, 0)
-        #        try:
-        #            libssl_SSL_CTX_set_tmp_ecdh(self.ctx, key)
-        #        finally:
-        #            libssl_EC_KEY_free(key)
+        if HAS_ECDH:
+            # Allow automatic ECDH curve selection (on
+            # OpenSSL 1.0.2+), or use prime256v1 by default.
+            # This is Apache mod_ssl's initialization
+            # policy, so we should be safe.
+            if lib.Cryptography_HAS_ECDH_SET_CURVE:
+                lib.SSL_CTX_set_ecdh_auto(self.ctx, 1)
+            else:
+                key = lib.EC_KEY_new_by_curve_name(lib.NID_X9_62_prime256v1)
+                if not key:
+                    # TODO copy from ropenssl?
+                    raise _ssl_seterror(space, None, 0)
+                try:
+                    lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
+                finally:
+                    lib.EC_KEY_free(key)
 
 #    def _finalize_(self):
 #        ctx = self.ctx
