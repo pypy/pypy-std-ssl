@@ -15,6 +15,12 @@ static const int Cryptography_HAS_ECDH;
 """
 
 FUNCTIONS = """
+#if CRYPTOGRAPHY_OPENSSL_LESS_THAN_102 || defined(LIBRESSL_VERSION_NUMBER)
+static const long Cryptography_HAS_ECDH_SET_CURVE = 0;
+#else
+static const long Cryptography_HAS_ECDH_SET_CURVE = 1;
+int SSL_CTX_set_ecdh_auto(SSL_CTX *ctx, int onoff);
+#endif
 """
 
 MACROS = """
