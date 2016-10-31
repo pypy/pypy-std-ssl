@@ -38,7 +38,7 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
         err_reason = lib.ERR_GET_REASON(errcode)
         reason_str = ERROR_CODES_TO_NAMES.get((err_lib, err_reason), None)
         lib_str = LIBRARY_CODES_TO_NAMES.get(err_lib, None)
-        msg = rffi.charp2str(lib.ERR_reason_error_string(errcode))
+        msg = ffi.string(lib.ERR_reason_error_string(errcode)).decode('utf-8')
     if not msg:
         msg = "unknown error"
     if reason_str and lib_str:
@@ -47,17 +47,17 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
         msg = "[%s] %s" % (lib_str, msg)
 
     raise Exception(msg)
-    w_exception_class = w_errtype or get_error(space).w_error
-    if errno or errcode:
-        w_exception = space.call_function(w_exception_class,
-                                          space.wrap(errno), space.wrap(msg))
-    else:
-        w_exception = space.call_function(w_exception_class, space.wrap(msg))
-    space.setattr(w_exception, space.wrap("reason"),
-                  space.wrap(reason_str) if reason_str else space.w_None)
-    space.setattr(w_exception, space.wrap("library"),
-                  space.wrap(lib_str) if lib_str else space.w_None)
-    return OperationError(w_exception_class, w_exception)
+    #w_exception_class = w_errtype or get_error(space).w_error
+    #if errno or errcode:
+    #    w_exception = space.call_function(w_exception_class,
+    #                                      space.wrap(errno), space.wrap(msg))
+    #else:
+    #    w_exception = space.call_function(w_exception_class, space.wrap(msg))
+    #space.setattr(w_exception, space.wrap("reason"),
+    #              space.wrap(reason_str) if reason_str else space.w_None)
+    #space.setattr(w_exception, space.wrap("library"),
+    #              space.wrap(lib_str) if lib_str else space.w_None)
+    #return OperationError(w_exception_class, w_exception)
 
 PROTOCOL_SSLv2  = 0
 PROTOCOL_SSLv3  = 1
@@ -78,6 +78,70 @@ if _HAS_TLS_UNIQUE:
     CHANNEL_BINDING_TYPES = ['tls-unique']
 else:
     CHANNEL_BINDING_TYPES = []
+
+def _ssl_seterror(ss, ret):
+    assert ret <= 0
+
+    errcode = lib.ERR_peek_last_error()
+
+    if ss is None:
+        return ssl_error(None, errcode=errcode)
+    elif ss.ssl:
+        err = lib.SSL_get_error(ss.ssl, ret)
+    else:
+        err = SSL_ERROR_SSL
+    w_errtype = None
+    errstr = ""
+    errval = 0
+
+    if err == SSL_ERROR_ZERO_RETURN:
+        w_errtype = get_error(space).w_ZeroReturnError
+        errstr = "TLS/SSL connection has been closed"
+        errval = PY_SSL_ERROR_ZERO_RETURN
+    elif err == SSL_ERROR_WANT_READ:
+        w_errtype = get_error(space).w_WantReadError
+        errstr = "The operation did not complete (read)"
+        errval = PY_SSL_ERROR_WANT_READ
+    elif err == SSL_ERROR_WANT_WRITE:
+        w_errtype = get_error(space).w_WantWriteError
+        errstr = "The operation did not complete (write)"
+        errval = PY_SSL_ERROR_WANT_WRITE
+    elif err == SSL_ERROR_WANT_X509_LOOKUP:
+        errstr = "The operation did not complete (X509 lookup)"
+        errval = PY_SSL_ERROR_WANT_X509_LOOKUP
+    elif err == SSL_ERROR_WANT_CONNECT:
+        errstr = "The operation did not complete (connect)"
+        errval = PY_SSL_ERROR_WANT_CONNECT
+    elif err == SSL_ERROR_SYSCALL:
+        e = libssl_ERR_get_error()
+        if e == 0:
+            if ret == 0 or ss.w_socket() is None:
+                w_errtype = get_error(space).w_EOFError
+                errstr = "EOF occurred in violation of protocol"
+                errval = PY_SSL_ERROR_EOF
+            elif ret == -1:
+                # the underlying BIO reported an I/0 error
+                error = rsocket.last_error()
+                return interp_socket.converted_error(space, error)
+            else:
+                w_errtype = get_error(space).w_SyscallError
+                errstr = "Some I/O error occurred"
+                errval = PY_SSL_ERROR_SYSCALL
+        else:
+            errstr = rffi.charp2str(libssl_ERR_error_string(e, None))
+            errval = PY_SSL_ERROR_SYSCALL
+    elif err == SSL_ERROR_SSL:
+        errval = PY_SSL_ERROR_SSL
+        if errcode != 0:
+            errstr = rffi.charp2str(libssl_ERR_error_string(errcode, None))
+        else:
+            errstr = "A failure in the SSL library occurred"
+    else:
+        errstr = "Invalid error code"
+        errval = PY_SSL_ERROR_INVALID_ERROR_CODE
+
+    return ssl_error(space, errstr, errval, w_errtype=w_errtype,
+                     errcode=errcode)
 
 class SSLContext(object):
     ctx = ffi.NULL
@@ -126,7 +190,7 @@ class SSLContext(object):
                 key = lib.EC_KEY_new_by_curve_name(lib.NID_X9_62_prime256v1)
                 if not key:
                     # TODO copy from ropenssl?
-                    raise _ssl_seterror(space, None, 0)
+                    raise _ssl_seterror(None, 0)
                 try:
                     lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
                 finally:
@@ -555,3 +619,235 @@ class SSLContext(object):
 #                                                 rffi.cast(rffi.VOIDP, index))
 #
 #
+
+RAND_status = lib.RAND_status
+RAND_add = lib.RAND_add
+
+def _RAND_bytes(count, pseudo):
+    if count < 0:
+        raise ValueError("num must be positive")
+    buf = ffi.new("unsigned char[]", b"\x00"*count)
+    if pseudo:
+        ok = lib.RAND_pseudo_bytes(buf, count)
+        if ok == 1 or ok == 0:
+            return (ffi.string(buf), ok == 1)
+    else:
+        ok = lib.RAND_bytes(buf, count)
+        if ok == 1:
+            return ffi.string(buf)
+    raise ssl_error("", errcode=lib.ERR_get_error())
+
+def RAND_pseudo_bytes(count):
+    return _RAND_bytes(count, True)
+
+def RAND_bytes(count):
+    return _RAND_bytes(count, False)
+
+def RAND_add(view, entropy):
+    # REVIEW unsure how to solve this. might be easy:
+    # str does not support buffer protocol.
+    # I think a user should really encode the string before it is 
+    # passed here!
+    if isinstance(view, str):
+        buf = ffi.from_buffer(view.encode())
+    else:
+        buf = ffi.from_buffer(view)
+    lib.RAND_add(buf, len(buf), entropy)
+
+def wrap_socket(s):
+    pass
+
+X509_NAME_MAXLEN = 256
+
+def _create_tuple_for_attribute(name, value):
+    buf = ffi.new("char[]", X509_NAME_MAXLEN)
+    length = lib.OBJ_obj2txt(buf, X509_NAME_MAXLEN, name, 0)
+    if length < 0:
+        raise _ssl_seterror(None, 0)
+    name = ffi.string(buf, length).decode('utf-8')
+
+    buf_ptr = ffi.new("unsigned char**")
+    length = lib.ASN1_STRING_to_UTF8(buf_ptr, value)
+    if length < 0:
+        raise _ssl_seterror(None, 0)
+    try:
+        value = ffi.string(buf_ptr[0]).decode('utf-8')
+    finally:
+        lib.OPENSSL_free(buf_ptr[0])
+    return (name, value)
+
+def _get_aia_uri(certificate, nid):
+    info = lib.X509_get_ext_d2i(certificate, lib.NID_info_access, ffi.NULL, ffi.NULL)
+    if (info == ffi.NULL):
+        return None;
+    if lib.sk_ACCESS_DESCRIPTION_num(info) == 0:
+        lib.AUTHORITY_INFO_ACCESS_free(info)
+        return None
+
+    lst = []
+    count = lib.sk_ACCESS_DESCRIPTION_num(info)
+    for i in range(count):
+        ad = lib.sk_ACCESS_DESCRIPTION_value(info, i)
+
+        if lib.OBJ_obj2nid(ad.method) != nid or \
+           ad.location.type != GEN_URI:
+            continue
+        uri = ad.location.d.uniformResourceIdentifier
+        ostr = ffi.string(uri.data, uri.length)
+        lst.append(ostr)
+    lib.AUTHORITY_INFO_ACCESS_free(info)
+
+    # convert to tuple or None
+    if len(lst) == 0: return None
+    return tuple(lst)
+
+
+def _create_tuple_for_X509_NAME(xname):
+    dn = []
+    rdn = []
+    rdn_level = -1
+    entry_count = lib.X509_NAME_entry_count(xname);
+    for index_counter in range(entry_count):
+        entry = lib.X509_NAME_get_entry(xname, index_counter);
+
+        # check to see if we've gotten to a new RDN
+        if rdn_level >= 0:
+            if rdn_level != entry.set:
+                dn.append(tuple(rdn))
+                rdn = []
+        rdn_level = entry.set
+
+        # now add this attribute to the current RDN
+        name = lib.X509_NAME_ENTRY_get_object(entry);
+        value = lib.X509_NAME_ENTRY_get_data(entry);
+        attr = _create_tuple_for_attribute(name, value);
+        if attr == ffi.NULL:
+            pass # TODO error
+            raise NotImplementedError
+        rdn.append(attr)
+
+    # now, there's typically a dangling RDN
+    if rdn and len(rdn) > 0:
+        dn.append(tuple(rdn))
+
+    return tuple(dn)
+
+def _decode_certificate(certificate):
+    #PyObject *retval = NULL;
+    #BIO *biobuf = NULL;
+    #PyObject *peer;
+    #PyObject *peer_alt_names = NULL;
+    #PyObject *issuer;
+    #PyObject *version;
+    #PyObject *sn_obj;
+    #PyObject *obj;
+    #ASN1_INTEGER *serialNumber;
+    #char buf[2048];
+    #int len, result;
+    #ASN1_TIME *notBefore, *notAfter;
+    #PyObject *pnotBefore, *pnotAfter;
+
+    retval = {}
+
+    peer = _create_tuple_for_X509_NAME(lib.X509_get_subject_name(certificate));
+    if not peer:
+        return None
+    retval["subject"] = peer
+
+    issuer = _create_tuple_for_X509_NAME(lib.X509_get_issuer_name(certificate));
+    if not issuer:
+        return None
+    retval["issuer"] = issuer
+
+    version = lib.X509_get_version(certificate) + 1
+    if version == 0:
+        return None
+    retval["version"] = version
+
+    biobuf = lib.BIO_new(lib.BIO_s_mem());
+
+    lib.BIO_reset(biobuf);
+    serialNumber = lib.X509_get_serialNumber(certificate);
+    # should not exceed 20 octets, 160 bits, so buf is big enough
+    lib.i2a_ASN1_INTEGER(biobuf, serialNumber)
+    buf = ffi.buf("char[2048]")
+    len = bio.BIO_gets(biobuf, buf, len(buf)-1)
+    if len < 0:
+        if biobuf: lib.BIO_free(biobuf)
+        raise _ssl_error(None) # TODO _setSSLError
+    retval["serialNumber"] = ffi.string(buf, len).decode('utf-8')
+
+    lib.BIO_reset(biobuf);
+    notBefore = lib.X509_get_notBefore(certificate);
+    lib.ASN1_TIME_print(biobuf, notBefore);
+    len = lib.BIO_gets(biobuf, buf, len(buf)-1);
+    if len < 0:
+        if biobuf: lib.BIO_free(biobuf)
+        raise _ssl_error(None) # TODO _setSSLError
+    retval["notBefore"] = ffi.string(buf, len).decode('utf-8')
+
+    lib.BIO_reset(biobuf);
+    notAfter = lib.X509_get_notAfter(certificate);
+    lib.ASN1_TIME_print(biobuf, notAfter);
+    len = lib.BIO_gets(biobuf, buf, len(buf)-1);
+    if len < 0:
+        raise _ssl_error(None) # TODO _setSSLError
+    retval["notAfter"] = ffi.string(buf, len);
+
+    # Now look for subjectAltName
+
+    peer_alt_names = _get_peer_alt_names(certificate);
+    if not peer_alt_names:
+        if biobuf: lib.BIO_free(biobuf)
+        return None
+    retval["subjectAltName"] = peer_alt_names
+
+    # Authority Information Access: OCSP URIs
+    obj = _get_aia_uri(certificate, lib.NID_ad_OCSP)
+    if not obj:
+        if biobuf: lib.BIO_free(biobuf)
+        return None
+    retval["OCSP"] = obj
+
+    obj = _get_aia_uri(certificate, lib.NID_ad_ca_issuers)
+    if not obj:
+        if biobuf: lib.BIO_free(biobuf)
+        return None
+    retval["caIssuers"] = obj
+
+    # CDP (CRL distribution points)
+    obj = _ssl._get_crl_dp(certificate)
+    if not obj:
+        if biobuf: lib.BIO_free(biobuf)
+        return None
+    retval["crlDistributionPoints"] = obj
+
+    lib.BIO_free(biobuf)
+    return retval
+
+
+class _ssl(object):
+    # for testing only
+    @staticmethod
+    def _test_decode_cert(path):
+        cert = lib.BIO_new(lib.BIO_s_file())
+        if cert is ffi.NULL:
+            lib.BIO_free(cert)
+            raise ssl_error("Can't malloc memory to read file")
+
+        # REVIEW how to encode this properly?
+        epath = path.encode()
+        if lib.BIO_read_filename(cert, epath) <= 0:
+            lib.BIO_free(cert)
+            raise ssl_error("Can't open file")
+
+        x = lib.PEM_read_bio_X509_AUX(cert, ffi.NULL, ffi.NULL, ffi.NULL)
+        if x is ffi.NULL:
+            ssl_error("Error decoding PEM-encoded file")
+
+        retval = _decode_certificate(x)
+        lib.X509_free(x);
+
+        if cert != ffi.NULL:
+            lib.BIO_free(cert)
+        return retval
