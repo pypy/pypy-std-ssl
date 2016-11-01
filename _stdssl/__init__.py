@@ -1,3 +1,4 @@
+import warnings
 from _openssl import ffi
 from _openssl import lib
 
@@ -701,6 +702,91 @@ def _get_aia_uri(certificate, nid):
     if len(lst) == 0: return None
     return tuple(lst)
 
+GENERAL_NAMES = ffi.typeof("GENERAL_NAMES*")
+
+def _string_from_asn1(asn1):
+    data = lib.ASN1_STRING_data(asn1)
+    length = lib.ASN1_STRING_length(asn1)
+    return ffi.string(ffi.cast("char*",data), length)
+
+def _get_peer_alt_names(certificate):
+    # this code follows the procedure outlined in
+    # OpenSSL's crypto/x509v3/v3_prn.c:X509v3_EXT_print()
+    # function to extract the STACK_OF(GENERAL_NAME),
+    # then iterates through the stack to add the
+    # names.
+    peer_alt_names = []
+
+    if certificate == ffi.NULL:
+        return None
+
+    # get a memory buffer
+    biobuf = lib.BIO_new(lib.BIO_s_mem());
+
+    i = -1
+    while True:
+        i = lib.X509_get_ext_by_NID(certificate, lib.NID_subject_alt_name, i)
+        if i < 0:
+            break
+
+
+        # now decode the altName
+        ext = lib.X509_get_ext(certificate, i);
+        method = lib.X509V3_EXT_get(ext)
+        if method is ffi.NULL:
+            raise ssl_error("No method for internalizing subjectAltName!")
+
+        ext_data = lib.X509_EXTENSION_get_data(ext)
+        ext_data_len = ext_data.length
+        ext_data_value = ffi.new("unsigned char**", ffi.NULL)
+        ext_data_value[0] = ext_data.data
+
+        if method.it != ffi.NULL:
+            names = lib.ASN1_item_d2i(ffi.NULL, ext_data_value, ext_data_len, lib.ASN1_ITEM_ptr(method.it))
+        else:
+            names = method.d2i(ffi.NULL, ext_data_value, ext_data_len)
+
+        names = ffi.cast(GENERAL_NAMES, names)
+        count = lib.sk_GENERAL_NAME_num(names)
+        for j in range(count):
+            # get a rendering of each name in the set of names
+            name = lib.sk_GENERAL_NAME_value(names, j);
+            _type = name.type
+            if _type == lib.GEN_DIRNAME:
+                # we special-case DirName as a tuple of
+                # tuples of attributes
+                v = _create_tuple_for_X509_NAME(name.d.dirn)
+                peer_alt_names.append(("DirName", v))
+            # GENERAL_NAME_print() doesn't handle NULL bytes in ASN1_string
+            # correctly, CVE-2013-4238
+            elif _type == lib.GEN_EMAIL:
+                v = _string_from_asn1(name.d.rfc822Name)
+                peer_alt_names.append(("email", v))
+            elif _type == lib.GEN_DNS:
+                v = _string_from_asn1(name.d.dNSName)
+                peer_alt_names.append(("DNS", v))
+            elif _type == lib.GEN_URI:
+                v = _string_from_asn1(name.d.uniformResourceIdentifier)
+                peer_alt_names.append(("URI", v))
+            else:
+                # for everything else, we use the OpenSSL print form
+                if _type not in (lib.GEN_OTHERNAME, lib.GEN_X400, \
+                                 lib.GEN_EDIPARTY, lib.GEN_IPADD, lib.GEN_RID):
+                    warnings.warn("Unknown general type %d" % _type, RuntimeWarning)
+                    continue
+                lib.BIO_reset(biobuf);
+                lib.GENERAL_NAME_print(biobuf, name);
+                v = _bio_get_str(biobuf)
+                idx = v.find(":")
+                if idx == -1:
+                    return None
+                peer_alt_names.append((v[:idx], v[idx:]))
+
+        lib.sk_GENERAL_NAME_pop_free(names, lib.GENERAL_NAME_free);
+    lib.BIO_free(biobuf)
+    if peer_alt_names is not None:
+        return tuple(peer_alt_names)
+    return peer_alt_names
 
 def _create_tuple_for_X509_NAME(xname):
     dn = []
@@ -711,11 +797,12 @@ def _create_tuple_for_X509_NAME(xname):
         entry = lib.X509_NAME_get_entry(xname, index_counter);
 
         # check to see if we've gotten to a new RDN
+        _set = lib.X509_NAME_ENTRY_set(entry)
         if rdn_level >= 0:
-            if rdn_level != entry.set:
+            if rdn_level != _set:
                 dn.append(tuple(rdn))
                 rdn = []
-        rdn_level = entry.set
+        rdn_level = _set
 
         # now add this attribute to the current RDN
         name = lib.X509_NAME_ENTRY_get_object(entry);
@@ -731,6 +818,15 @@ def _create_tuple_for_X509_NAME(xname):
         dn.append(tuple(rdn))
 
     return tuple(dn)
+
+STATIC_BIO_BUF = ffi.new("char[]", 2048)
+
+def _bio_get_str(biobuf):
+    length = lib.BIO_gets(biobuf, STATIC_BIO_BUF, len(STATIC_BIO_BUF)-1)
+    if length < 0:
+        if biobuf: lib.BIO_free(biobuf)
+        raise _ssl_error(None) # TODO _setSSLError
+    return ffi.string(STATIC_BIO_BUF, length).decode('utf-8')
 
 def _decode_certificate(certificate):
     #PyObject *retval = NULL;
@@ -770,29 +866,29 @@ def _decode_certificate(certificate):
     serialNumber = lib.X509_get_serialNumber(certificate);
     # should not exceed 20 octets, 160 bits, so buf is big enough
     lib.i2a_ASN1_INTEGER(biobuf, serialNumber)
-    buf = ffi.buf("char[2048]")
-    len = bio.BIO_gets(biobuf, buf, len(buf)-1)
-    if len < 0:
+    buf = ffi.new("char[]", 2048)
+    length = lib.BIO_gets(biobuf, buf, len(buf)-1)
+    if length < 0:
         if biobuf: lib.BIO_free(biobuf)
         raise _ssl_error(None) # TODO _setSSLError
-    retval["serialNumber"] = ffi.string(buf, len).decode('utf-8')
+    retval["serialNumber"] = ffi.string(buf, length).decode('utf-8')
 
     lib.BIO_reset(biobuf);
     notBefore = lib.X509_get_notBefore(certificate);
     lib.ASN1_TIME_print(biobuf, notBefore);
-    len = lib.BIO_gets(biobuf, buf, len(buf)-1);
-    if len < 0:
+    length = lib.BIO_gets(biobuf, buf, len(buf)-1);
+    if length < 0:
         if biobuf: lib.BIO_free(biobuf)
         raise _ssl_error(None) # TODO _setSSLError
-    retval["notBefore"] = ffi.string(buf, len).decode('utf-8')
+    retval["notBefore"] = ffi.string(buf, length).decode('utf-8')
 
     lib.BIO_reset(biobuf);
     notAfter = lib.X509_get_notAfter(certificate);
     lib.ASN1_TIME_print(biobuf, notAfter);
-    len = lib.BIO_gets(biobuf, buf, len(buf)-1);
-    if len < 0:
+    length = lib.BIO_gets(biobuf, buf, len(buf)-1);
+    if length < 0:
         raise _ssl_error(None) # TODO _setSSLError
-    retval["notAfter"] = ffi.string(buf, len);
+    retval["notAfter"] = ffi.string(buf, length);
 
     # Now look for subjectAltName
 
