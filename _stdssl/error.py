@@ -56,6 +56,21 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
 ERR_CODES_TO_NAMES = {}
 LIB_CODES_TO_NAMES = {}
 
+# TODO errcode = error_codes;
+# TODO while (errcode->mnemonic != NULL) {
+# TODO     mnemo = PyUnicode_FromString(errcode->mnemonic);
+# TODO     key = Py_BuildValue("ii", errcode->library, errcode->reason);
+# TODO     if (mnemo == NULL || key == NULL)
+# TODO         return NULL;
+# TODO     if (PyDict_SetItem(err_codes_to_names, key, mnemo))
+# TODO         return NULL;
+# TODO     if (PyDict_SetItem(err_names_to_codes, mnemo, key))
+# TODO         return NULL;
+# TODO     Py_DECREF(key);
+# TODO     Py_DECREF(mnemo);
+# TODO     errcode++;
+# TODO }
+
 def _fill_and_raise_ssl_error(error, errcode):
     pass
     if errcode != 0:

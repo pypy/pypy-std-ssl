@@ -64,9 +64,15 @@ lib.SSL_library_init()
 # TODO threads?
 lib.OpenSSL_add_all_algorithms()
 
+class PasswordInfo(object):
+    w_callable = None
+    password = None
+    operationerror = None
+PWINFO_STORAGE = {}
+
 
 class _SSLContext(object):
-    __slots__ = ('ctx', 'check_hostname')
+    __slots__ = ('ctx', 'check_hostname', 'verify_mode')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -88,7 +94,7 @@ class _SSLContext(object):
 
         self.ctx = lib.SSL_CTX_new(method)
         if self.ctx == ffi.NULL: 
-            raise ssl_error("failed to allocate SSL context" + r)
+            raise ssl_error("failed to allocate SSL context")
 
         self.check_hostname = False
         # TODO self.register_finalizer(space)
@@ -122,13 +128,79 @@ class _SSLContext(object):
         return self
 
     def set_ciphers(self, cipherlist):
-        ret = lib.SSL_CTX_set_cipher_list(self.ctx, cipherlist)
+        cipherlistbuf = _str_to_ffi_buffer(cipherlist)
+        ret = lib.SSL_CTX_set_cipher_list(self.ctx, cipherlistbuf)
         if ret == 0:
             # Clearing the error queue is necessary on some OpenSSL
             # versions, otherwise the error will be reported again
             # when another SSL call is done.
             lib.ERR_clear_error()
             raise ssl_error("No cipher can be selected.")
+
+    def load_cert_chain(self, certfile, keyfile=None, password=None):
+        if keyfile is None:
+            keyfile = certfile
+        pw_info = PasswordInfo()
+        index = -1
+        if password is None:
+            index = rthread.get_ident()
+            PWINFO_STORAGE[index] = pw_info
+
+            if space.is_true(space.callable(w_password)):
+                pw_info.w_callable = w_password
+            else:
+                if space.isinstance_w(w_password, space.w_unicode):
+                    pw_info.password = space.str_w(w_password)
+                else:
+                    try:
+                        pw_info.password = space.bufferstr_w(w_password)
+                    except OperationError as e:
+                        if not e.match(space, space.w_TypeError):
+                            raise
+                        raise oefmt(space.w_TypeError,
+                                    "password should be a string or callable")
+
+            lib.SSL_CTX_set_default_passwd_cb(self.ctx, _password_callback)
+            lib.SSL_CTX_set_default_passwd_cb_userdata(
+                self.ctx, rffi.cast(rffi.VOIDP, index))
+
+        try:
+            ret = lib.SSL_CTX_use_certificate_chain_file(self.ctx, certfile)
+            if ret != 1:
+                if pw_info.operationerror:
+                    libssl_ERR_clear_error()
+                    raise pw_info.operationerror
+                errno = get_saved_errno()
+                if errno:
+                    lib.ERR_clear_error()
+                    raise OSError(OSError(errno, ''))
+                else:
+                    raise _ssl_seterror(space, None, -1)
+
+            ret = lib.SSL_CTX_use_PrivateKey_file(self.ctx, keyfile,
+                                                  lib.SSL_FILETYPE_PEM)
+            if ret != 1:
+                if pw_info.operationerror:
+                    libssl_ERR_clear_error()
+                    raise pw_info.operationerror
+                errno = get_saved_errno()
+                if errno:
+                    libssl_ERR_clear_error()
+                    raise wrap_oserror(space, OSError(errno, ''),
+                                       exception_name = 'w_IOError')
+                else:
+                    raise _ssl_seterror(space, None, -1)
+
+            ret = libssl_SSL_CTX_check_private_key(self.ctx)
+            if ret != 1:
+                raise _ssl_seterror(space, None, -1)
+        finally:
+            if index >= 0:
+                del PWINFO_STORAGE[index]
+            lib.SSL_CTX_set_default_passwd_cb(
+                self.ctx, lltype.nullptr(pem_password_cb.TO))
+            lib.SSL_CTX_set_default_passwd_cb_userdata(
+                self.ctx, None)
 
 
 #    def _finalize_(self):
@@ -247,81 +319,6 @@ class _SSLContext(object):
 #                        "check_hostname needs a SSL context with either "
 #                        "CERT_OPTIONAL or CERT_REQUIRED")
 #        self.check_hostname = check_hostname
-#
-#    def load_cert_chain_w(self, space, w_certfile, w_keyfile=None,
-#                          w_password=None):
-#        if space.is_none(w_certfile):
-#            certfile = None
-#        else:
-#            certfile = space.str_w(w_certfile)
-#        if space.is_none(w_keyfile):
-#            keyfile = certfile
-#        else:
-#            keyfile = space.str_w(w_keyfile)
-#        pw_info = PasswordInfo()
-#        pw_info.space = space
-#        index = -1
-#        if not space.is_none(w_password):
-#            index = rthread.get_ident()
-#            PWINFO_STORAGE[index] = pw_info
-#
-#            if space.is_true(space.callable(w_password)):
-#                pw_info.w_callable = w_password
-#            else:
-#                if space.isinstance_w(w_password, space.w_unicode):
-#                    pw_info.password = space.str_w(w_password)
-#                else:
-#                    try:
-#                        pw_info.password = space.bufferstr_w(w_password)
-#                    except OperationError as e:
-#                        if not e.match(space, space.w_TypeError):
-#                            raise
-#                        raise oefmt(space.w_TypeError,
-#                                    "password should be a string or callable")
-#
-#            libssl_SSL_CTX_set_default_passwd_cb(
-#                self.ctx, _password_callback)
-#            libssl_SSL_CTX_set_default_passwd_cb_userdata(
-#                self.ctx, rffi.cast(rffi.VOIDP, index))
-#
-#        try:
-#            ret = libssl_SSL_CTX_use_certificate_chain_file(self.ctx, certfile)
-#            if ret != 1:
-#                if pw_info.operationerror:
-#                    libssl_ERR_clear_error()
-#                    raise pw_info.operationerror
-#                errno = get_saved_errno()
-#                if errno:
-#                    libssl_ERR_clear_error()
-#                    raise wrap_oserror(space, OSError(errno, ''),
-#                                       exception_name = 'w_IOError')
-#                else:
-#                    raise _ssl_seterror(space, None, -1)
-#
-#            ret = libssl_SSL_CTX_use_PrivateKey_file(self.ctx, keyfile,
-#                                                     SSL_FILETYPE_PEM)
-#            if ret != 1:
-#                if pw_info.operationerror:
-#                    libssl_ERR_clear_error()
-#                    raise pw_info.operationerror
-#                errno = get_saved_errno()
-#                if errno:
-#                    libssl_ERR_clear_error()
-#                    raise wrap_oserror(space, OSError(errno, ''),
-#                                       exception_name = 'w_IOError')
-#                else:
-#                    raise _ssl_seterror(space, None, -1)
-#
-#            ret = libssl_SSL_CTX_check_private_key(self.ctx)
-#            if ret != 1:
-#                raise _ssl_seterror(space, None, -1)
-#        finally:
-#            if index >= 0:
-#                del PWINFO_STORAGE[index]
-#            libssl_SSL_CTX_set_default_passwd_cb(
-#                self.ctx, lltype.nullptr(pem_password_cb.TO))
-#            libssl_SSL_CTX_set_default_passwd_cb_userdata(
-#                self.ctx, None)
 #
 #    @unwrap_spec(filepath=str)
 #    def load_dh_params_w(self, space, filepath):
