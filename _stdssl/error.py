@@ -1,6 +1,29 @@
 from _openssl import ffi
 from _openssl import lib
 
+class SSLError(OSError):
+    """ An error occurred in the SSL implementation. """
+
+class SSLZeroReturnError(SSLError):
+    """ SSL/TLS session closed cleanly. """
+
+class SSLWantReadError(SSLError):
+    """ Non-blocking SSL socket needs to read more data
+        before the requested operation can be completed.
+    """
+
+class SSLWantWriteError(SSLError):
+    """Non-blocking SSL socket needs to write more data
+       before the requested operation can be completed.
+    """
+
+class SSLSyscallError(SSLError):
+    """ System error when attempting SSL operation. """
+
+class SSLEOFError(SSLError):
+    """ SSL/TLS connection terminated abruptly. """
+
+
 def ssl_error(msg, errno=0, errtype=None, errcode=0):
     reason_str = None
     lib_str = None
@@ -17,7 +40,7 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
     elif lib_str:
         msg = "[%s] %s" % (lib_str, msg)
 
-    raise Exception(msg)
+    raise SSLError(msg)
     #w_exception_class = w_errtype or get_error(space).w_error
     #if errno or errcode:
     #    w_exception = space.call_function(w_exception_class,
@@ -29,6 +52,27 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
     #space.setattr(w_exception, space.wrap("library"),
     #              space.wrap(lib_str) if lib_str else space.w_None)
     #return OperationError(w_exception_class, w_exception)
+
+ERR_CODES_TO_NAMES = {}
+LIB_CODES_TO_NAMES = {}
+
+def _fill_and_raise_ssl_error(error, errcode):
+    pass
+    if errcode != 0:
+        library = lib.ERR_GET_LIB(errcode);
+        reason = lib.ERR_GET_REASON(errcode);
+        key = (library, reason)
+        reason_obj = ERR_CODES_TO_NAMES[key]
+        lib_obj = LIB_CODES_TO_NAMES[library]
+        raise error("[%S: %S]" % (lib_obj, reason_obj))
+
+def _last_error():
+    errcode = lib.ERR_peek_last_error()
+    _fill_and_raise_ssl_error(SSLError, errcode)
+    #buf = ffi.new("char[4096]")
+    #length = lib.ERR_error_string(errcode, buf)
+    #return ffi.string(buf).decode()
+
 
 def _ssl_seterror(ss, ret):
     assert ret <= 0

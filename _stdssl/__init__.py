@@ -1,7 +1,11 @@
 from _openssl import ffi
 from _openssl import lib
-from openssl._stdssl.certificate import *
-from openssl._stdssl.certificate import _test_decode_cert
+from _ssl._stdssl.certificate import *
+from _ssl._stdssl.certificate import _test_decode_cert
+from _ssl._stdssl.utility import _str_with_len
+
+from _ssl._stdssl.error import *
+from _ssl._stdssl.error import _last_error
 
 OPENSSL_VERSION = ffi.string(lib.OPENSSL_VERSION_TEXT).decode('utf-8')
 OPENSSL_VERSION_NUMBER = lib.OPENSSL_VERSION_NUMBER
@@ -20,7 +24,7 @@ HAS_ECDH = bool(lib.Cryptography_HAS_ECDH)
 HAS_SNI = bool(lib.Cryptography_HAS_TLSEXT_HOSTNAME)
 HAS_ALPN = bool(lib.Cryptography_HAS_ALPN)
 HAS_NPN = False
-_HAS_TLS_UNIQUE = True
+HAS_TLS_UNIQUE = True
 
 CLIENT = 0
 SERVER = 1
@@ -32,8 +36,6 @@ CERT_REQUIRED = 2
 for name in dir(lib):
     if name.startswith('SSL_OP'):
         globals()[name[4:]] = getattr(lib, name)
-
-from openssl._stdssl.error import ssl_error
 
 
 PROTOCOL_SSLv2  = 0
@@ -51,15 +53,24 @@ from enum import Enum as _Enum, IntEnum as _IntEnum
 _IntEnum._convert('_SSLMethod', __name__,
         lambda name: name.startswith('PROTOCOL_'))
 
-if _HAS_TLS_UNIQUE:
+if HAS_TLS_UNIQUE:
     CHANNEL_BINDING_TYPES = ['tls-unique']
 else:
     CHANNEL_BINDING_TYPES = []
 
-class SSLContext(object):
-    ctx = ffi.NULL
+# init open ssl
+lib.SSL_load_error_strings()
+lib.SSL_library_init()
+# TODO threads?
+lib.OpenSSL_add_all_algorithms()
 
-    def __init__(self, protocol):
+
+class _SSLContext(object):
+    __slots__ = ('ctx', 'check_hostname')
+
+    def __new__(cls, protocol):
+        self = object.__new__(cls)
+        self.ctx = ffi.NULL
         if protocol == PROTOCOL_TLSv1:
             method = lib.TLSv1_method()
         elif lib.Cryptography_HAS_TLSv1_2 and protocol == PROTOCOL_TLSv1_1:
@@ -76,14 +87,14 @@ class SSLContext(object):
             raise ValueError("invalid protocol version")
 
         self.ctx = lib.SSL_CTX_new(method)
-        if self.ctx is ffi.NULL:
-            raise ssl_error("failed to allocate SSL context")
+        if self.ctx == ffi.NULL: 
+            raise ssl_error("failed to allocate SSL context" + r)
 
         self.check_hostname = False
         # TODO self.register_finalizer(space)
 
         # Defaults
-        lib.SSL_CTX_set_verify(self.ctx, lib.SSL_VERIFY_NONE, None)
+        lib.SSL_CTX_set_verify(self.ctx, lib.SSL_VERIFY_NONE, ffi.NULL)
         options = lib.SSL_OP_ALL & ~lib.SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
         if protocol != PROTOCOL_SSLv2:
             options |= lib.SSL_OP_NO_SSLv2
@@ -108,6 +119,17 @@ class SSLContext(object):
                     lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
                 finally:
                     lib.EC_KEY_free(key)
+        return self
+
+    def set_ciphers(self, cipherlist):
+        ret = lib.SSL_CTX_set_cipher_list(self.ctx, cipherlist)
+        if ret == 0:
+            # Clearing the error queue is necessary on some OpenSSL
+            # versions, otherwise the error will be reported again
+            # when another SSL call is done.
+            lib.ERR_clear_error()
+            raise ssl_error("No cipher can be selected.")
+
 
 #    def _finalize_(self):
 #        ctx = self.ctx
@@ -121,16 +143,6 @@ class SSLContext(object):
 #        self = space.allocate_instance(SSLContext, w_subtype)
 #        self.__init__(space, protocol)
 #        return space.wrap(self)
-#
-#    @unwrap_spec(cipherlist=str)
-#    def set_ciphers_w(self, space, cipherlist):
-#        ret = libssl_SSL_CTX_set_cipher_list(self.ctx, cipherlist)
-#        if ret == 0:
-#            # Clearing the error queue is necessary on some OpenSSL
-#            # versions, otherwise the error will be reported again
-#            # when another SSL call is done.
-#            libssl_ERR_clear_error()
-#            raise ssl_error(space, "No cipher can be selected.")
 #
 #    @unwrap_spec(server_side=int)
 #    def wrap_socket_w(self, space, w_sock, server_side,
@@ -533,6 +545,37 @@ class SSLContext(object):
 #
 #
 
+def _asn1obj2py(obj):
+    nid = lib.OBJ_obj2nid(obj)
+    if nid == lib.NID_undef:
+        raise ValueError("Unknown object")
+    sn = lib.OBJ_nid2sn(nid)
+    ln = lib.OBJ_nid2ln(nid)
+    buf = ffi.new("char[255]")
+    length = lib.OBJ_obj2txt(buf, len(buf), obj, 1)
+    if length < 0:
+        _setSSLError("todo")
+    if length > 0:
+        return (nid, sn, ln, _str_with_len(buf, length))
+    else:
+        return (nid, sn, ln, None)
+
+def txt2obj(txt, name):
+    _bytes = _str_to_ffi_buffer(txt)
+    obj = lib.OBJ_txt2obj(_bytes, int(name))
+    if obj is ffi.NULL:
+        raise ValueError("unkown object '%s'", txt)
+    result = _asn1obj2py(obj)
+    lib.ASN1_OBJECT_free(obj)
+    return result
+
+def nid2obj(nid):
+    raise NotImplementedError
+                                                               
+
+class MemoryBIO(object):
+    pass # TODO
+
 RAND_status = lib.RAND_status
 RAND_add = lib.RAND_add
 
@@ -556,22 +599,20 @@ def RAND_pseudo_bytes(count):
 def RAND_bytes(count):
     return _RAND_bytes(count, False)
 
-def RAND_add(view, entropy):
+def _str_to_ffi_buffer(view):
     # REVIEW unsure how to solve this. might be easy:
     # str does not support buffer protocol.
     # I think a user should really encode the string before it is 
     # passed here!
     if isinstance(view, str):
-        buf = ffi.from_buffer(view.encode())
+        return ffi.from_buffer(view.encode())
     else:
-        buf = ffi.from_buffer(view)
+        return ffi.from_buffer(view)
+
+def RAND_add(view, entropy):
+    buf = _str_to_ffi_buffer(view)
     lib.RAND_add(buf, len(buf), entropy)
 
-def wrap_socket(s):
-    pass
 
 
 
-class _ssl(object):
-    # for testing only
-    _test_decode_cert = _test_decode_cert
