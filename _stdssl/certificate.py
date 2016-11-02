@@ -1,7 +1,7 @@
 import warnings
 from _openssl import ffi
 from _openssl import lib
-from openssl._stdssl.utility import _string_from_asn1
+from openssl._stdssl.utility import _string_from_asn1, _str_with_len
 from openssl._stdssl.error import ssl_error, _ssl_seterror
 
 X509_NAME_MAXLEN = 256
@@ -11,14 +11,14 @@ def _create_tuple_for_attribute(name, value):
     length = lib.OBJ_obj2txt(buf, X509_NAME_MAXLEN, name, 0)
     if length < 0:
         raise _ssl_seterror(None, 0)
-    name = ffi.string(buf, length).decode('utf-8')
+    name = _str_with_len(buf, length)
 
     buf_ptr = ffi.new("unsigned char**")
     length = lib.ASN1_STRING_to_UTF8(buf_ptr, value)
     if length < 0:
         raise _ssl_seterror(None, 0)
     try:
-        value = ffi.string(buf_ptr[0]).decode('utf-8')
+        value = _str_with_len(buf_ptr[0], length)
     finally:
         lib.OPENSSL_free(buf_ptr[0])
     return (name, value)
@@ -40,7 +40,7 @@ def _get_aia_uri(certificate, nid):
            ad.location.type != lib.GEN_URI:
             continue
         uri = ad.location.d.uniformResourceIdentifier
-        ostr = ffi.string(uri.data, uri.length).decode('utf-8')
+        ostr = _str_with_len(uri.data, uri.length)
         lst.append(ostr)
     lib.AUTHORITY_INFO_ACCESS_free(info)
 
@@ -119,7 +119,7 @@ def _get_peer_alt_names(certificate):
                 idx = v.find(":")
                 if idx == -1:
                     return None
-                peer_alt_names.append((v[:idx], v[idx:]))
+                peer_alt_names.append((v[:idx], v[idx+1:]))
 
         free_func_addr = ffi.addressof(lib, "GENERAL_NAME_free")
         lib.sk_GENERAL_NAME_pop_free(names, free_func_addr);
@@ -166,7 +166,7 @@ def _bio_get_str(biobuf):
     if length < 0:
         if biobuf: lib.BIO_free(biobuf)
         raise _ssl_error(None) # TODO _setSSLError
-    return ffi.string(STATIC_BIO_BUF, length).decode('utf-8')
+    return _str_with_len(STATIC_BIO_BUF, length)
 
 def _decode_certificate(certificate):
     retval = {}
@@ -198,7 +198,7 @@ def _decode_certificate(certificate):
         if length < 0:
             if biobuf: lib.BIO_free(biobuf)
             raise _ssl_error(None) # TODO _setSSLError
-        retval["serialNumber"] = ffi.string(buf, length).decode('utf-8')
+        retval["serialNumber"] = _str_with_len(buf, length)
 
         lib.BIO_reset(biobuf);
         notBefore = lib.X509_get_notBefore(certificate);
@@ -207,7 +207,7 @@ def _decode_certificate(certificate):
         if length < 0:
             if biobuf: lib.BIO_free(biobuf)
             raise _ssl_error(None) # TODO _setSSLError
-        retval["notBefore"] = ffi.string(buf, length).decode('utf-8')
+        retval["notBefore"] = _str_with_len(buf, length)
 
         lib.BIO_reset(biobuf);
         notAfter = lib.X509_get_notAfter(certificate);
@@ -215,10 +215,9 @@ def _decode_certificate(certificate):
         length = lib.BIO_gets(biobuf, buf, len(buf)-1);
         if length < 0:
             raise _ssl_error(None) # TODO _setSSLError
-        retval["notAfter"] = ffi.string(buf, length).decode('utf-8')
+        retval["notAfter"] = _str_with_len(buf, length)
 
         # Now look for subjectAltName
-
         peer_alt_names = _get_peer_alt_names(certificate);
         if not peer_alt_names:
             if biobuf: lib.BIO_free(biobuf)
@@ -271,7 +270,7 @@ def _get_crl_dp(certificate):
                 continue
 
             uri = gn.d.uniformResourceIdentifier;
-            ouri = ffi.string(ffi.cast("char*", uri.data), uri.length).decode('utf-8')
+            ouri = _str_with_len(uri.data, uri.length)
             lst.append(ouri)
 
     if lib.OPENSSL_VERSION_NUMBER < 0x10001000:
