@@ -1,5 +1,6 @@
 from _openssl import ffi
 from _openssl import lib
+from openssl._stdssl.certificate import *
 from openssl._stdssl.certificate import _test_decode_cert
 
 OPENSSL_VERSION = ffi.string(lib.OPENSSL_VERSION_TEXT).decode('utf-8')

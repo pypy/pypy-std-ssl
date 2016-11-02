@@ -1,4 +1,6 @@
 import warnings
+import base64
+import textwrap
 from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.utility import _string_from_asn1, _str_with_len
@@ -301,3 +303,28 @@ def _test_decode_cert(path):
     if cert != ffi.NULL:
         lib.BIO_free(cert)
     return retval
+
+PEM_HEADER = "-----BEGIN CERTIFICATE-----"
+PEM_FOOTER = "-----END CERTIFICATE-----"
+
+def PEM_cert_to_DER_cert(pem_cert_string):
+    """Takes a certificate in ASCII PEM format and returns the
+    DER-encoded version of it as a byte sequence"""
+
+    if not pem_cert_string.startswith(PEM_HEADER):
+        raise ValueError("Invalid PEM encoding; must start with %s"
+                         % PEM_HEADER)
+    if not pem_cert_string.strip().endswith(PEM_FOOTER):
+        raise ValueError("Invalid PEM encoding; must end with %s"
+                         % PEM_FOOTER)
+    d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
+    return base64.decodebytes(d.encode('ASCII', 'strict'))
+
+def DER_cert_to_PEM_cert(der_cert_bytes):
+    """Takes a certificate in binary DER format and returns the
+    PEM version of it as a string."""
+
+    f = str(base64.standard_b64encode(der_cert_bytes), 'ASCII', 'strict')
+    return (PEM_HEADER + '\n' +
+            textwrap.fill(f, 64) + '\n' +
+            PEM_FOOTER + '\n')
