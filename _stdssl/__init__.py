@@ -1,3 +1,4 @@
+import sys
 import time
 import _thread
 import weakref
@@ -44,7 +45,8 @@ for name in dir(lib):
 SSL_CLIENT = 0
 SSL_SERVER = 1
 
-PROTOCOL_SSLv2  = 0
+if lib.Cryptography_HAS_SSL2:
+    PROTOCOL_SSLv2  = 0
 PROTOCOL_SSLv3  = 1
 PROTOCOL_SSLv23 = 2
 PROTOCOL_TLSv1    = 3
@@ -229,7 +231,7 @@ class _SSLContext(object):
             method = lib.TLSv1_2_method()
         elif protocol == PROTOCOL_SSLv3 and lib.Cryptography_HAS_SSL3_METHOD:
             method = lib.SSLv3_method()
-        elif protocol == PROTOCOL_SSLv2 and lib.Cryptography_HAS_SSL2_METHOD:
+        elif lib.Cryptography_HAS_SSL2 and protocol == PROTOCOL_SSLv2:
             method = lib.SSLv2_method()
         elif protocol == PROTOCOL_SSLv23:
             method = lib.SSLv23_method()
@@ -238,6 +240,7 @@ class _SSLContext(object):
 
         self.ctx = lib.SSL_CTX_new(method)
         if self.ctx == ffi.NULL: 
+            import pdb; pdb.set_trace()
             raise ssl_error("failed to allocate SSL context")
 
         self.check_hostname = False
@@ -246,7 +249,7 @@ class _SSLContext(object):
         # Defaults
         lib.SSL_CTX_set_verify(self.ctx, lib.SSL_VERIFY_NONE, ffi.NULL)
         options = lib.SSL_OP_ALL & ~lib.SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
-        if protocol != PROTOCOL_SSLv2:
+        if not lib.Cryptography_HAS_SSL2 or protocol != PROTOCOL_SSLv2:
             options |= lib.SSL_OP_NO_SSLv2
         if protocol != PROTOCOL_SSLv3:
             options |= lib.SSL_OP_NO_SSLv3
@@ -665,12 +668,15 @@ class _SSLContext(object):
 #
 #
 
+def _str_from_buf(buf):
+    return ffi.string(buf).decode('utf-8')
+
 def _asn1obj2py(obj):
     nid = lib.OBJ_obj2nid(obj)
     if nid == lib.NID_undef:
         raise ValueError("Unknown object")
-    sn = lib.OBJ_nid2sn(nid)
-    ln = lib.OBJ_nid2ln(nid)
+    sn = _str_from_buf(lib.OBJ_nid2sn(nid))
+    ln = _str_from_buf(lib.OBJ_nid2ln(nid))
     buf = ffi.new("char[255]")
     length = lib.OBJ_obj2txt(buf, len(buf), obj, 1)
     if length < 0:
@@ -682,15 +688,23 @@ def _asn1obj2py(obj):
 
 def txt2obj(txt, name):
     _bytes = _str_to_ffi_buffer(txt)
-    obj = lib.OBJ_txt2obj(_bytes, int(name))
-    if obj is ffi.NULL:
-        raise ValueError("unkown object '%s'", txt)
+    is_name = 0 if name else 1
+    obj = lib.OBJ_txt2obj(_bytes, is_name)
+    if obj == ffi.NULL:
+        raise ValueError("unknown object '%s'" % txt)
     result = _asn1obj2py(obj)
     lib.ASN1_OBJECT_free(obj)
     return result
 
 def nid2obj(nid):
-    raise NotImplementedError
+    if nid < lib.NID_undef:
+        raise ValueError("NID must be positive.")
+    obj = lib.OBJ_nid2obj(nid);
+    if obj == ffi.NULL:
+        raise ValueError("unknown NID %i" % nid)
+    result = _asn1obj2py(obj);
+    lib.ASN1_OBJECT_free(obj);
+    return result;
                                                                
 
 class MemoryBIO(object):
@@ -744,7 +758,7 @@ def _cstr_decode_fs(buf):
 #        if (!target) goto error; \
 #    }
     # XXX
-    return ffi.string(buf).decode('utf-8')
+    return ffi.string(buf).decode(sys.getfilesystemencoding())
 
 def get_default_verify_paths():
 
