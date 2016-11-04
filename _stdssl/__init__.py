@@ -42,6 +42,8 @@ for name in dir(lib):
     if name.startswith('SSL_OP'):
         globals()[name[4:]] = getattr(lib, name)
 
+OP_ALL = lib.SSL_OP_ALL & ~lib.SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
+
 SSL_CLIENT = 0
 SSL_SERVER = 1
 
@@ -240,7 +242,6 @@ class _SSLContext(object):
 
         self.ctx = lib.SSL_CTX_new(method)
         if self.ctx == ffi.NULL: 
-            import pdb; pdb.set_trace()
             raise ssl_error("failed to allocate SSL context")
 
         self.check_hostname = False
@@ -273,6 +274,24 @@ class _SSLContext(object):
                 finally:
                     lib.EC_KEY_free(key)
         return self
+
+    @property
+    def options(self):
+        return lib.SSL_CTX_get_options(self.ctx)
+
+    @options.setter
+    def options(self, value):
+        new_opts = int(value)
+        opts = lib.SSL_CTX_get_options(self.ctx)
+        clear = opts & ~new_opts
+        set = ~opts & new_opts
+        if clear:
+            if lib.Cryptography_HAS_SSL_CTX_CLEAR_OPTIONS:
+                lib.SSL_CTX_clear_options(self.ctx, clear)
+            else:
+                raise ValueError("can't clear options before OpenSSL 0.9.8m")
+        if set:
+            lib.SSL_CTX_set_options(self.ctx, set)
 
     def set_ciphers(self, cipherlist):
         cipherlistbuf = _str_to_ffi_buffer(cipherlist)
