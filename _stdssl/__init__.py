@@ -34,6 +34,13 @@ HAS_TLS_UNIQUE = True
 CLIENT = 0
 SERVER = 1
 
+VERIFY_DEFAULT = 0
+VERIFY_CRL_CHECK_LEAF = lib.X509_V_FLAG_CRL_CHECK 
+VERIFY_CRL_CHECK_CHAIN = lib.X509_V_FLAG_CRL_CHECK | lib.X509_V_FLAG_CRL_CHECK_ALL
+VERIFY_X509_STRICT = lib.X509_V_FLAG_X509_STRICT
+if lib.Cryptography_HAS_X509_V_FLAG_TRUSTED_FIRST:
+    VERIFY_X509_TRUSTED_FIRST = lib.X509_V_FLAG_TRUSTED_FIRST
+
 CERT_NONE = 0
 CERT_OPTIONAL = 1
 CERT_REQUIRED = 2
@@ -220,7 +227,7 @@ class _SSLSocket(object):
 
 
 class _SSLContext(object):
-    __slots__ = ('ctx', 'check_hostname', 'verify_mode')
+    __slots__ = ('ctx', 'check_hostname')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -273,6 +280,9 @@ class _SSLContext(object):
                     lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
                 finally:
                     lib.EC_KEY_free(key)
+        if lib.Cryptography_HAS_X509_V_FLAG_TRUSTED_FIRST:
+            store = lib.SSL_CTX_get_cert_store(self.ctx)
+            lib.X509_STORE_set_flags(store, lib.X509_V_FLAG_TRUSTED_FIRST)
         return self
 
     @property
@@ -292,6 +302,57 @@ class _SSLContext(object):
                 raise ValueError("can't clear options before OpenSSL 0.9.8m")
         if set:
             lib.SSL_CTX_set_options(self.ctx, set)
+
+    @property
+    def verify_mode(self):
+        mode = lib.SSL_CTX_get_verify_mode(self.ctx)
+        if mode == lib.SSL_VERIFY_NONE:
+            return CERT_NONE
+        elif mode == lib.SSL_VERIFY_PEER:
+            return CERT_OPTIONAL
+        elif mode == lib.SSL_VERIFY_PEER | lib.SSL_VERIFY_FAIL_IF_NO_PEER_CERT:
+            return CERT_REQUIRED
+        raise ssl_error("invalid return value from SSL_CTX_get_verify_mode")
+
+    @verify_mode.setter
+    def verify_mode(self, value):
+        n = int(value)
+        if n == CERT_NONE:
+            mode = lib.SSL_VERIFY_NONE
+        elif n == CERT_OPTIONAL:
+            mode = lib.SSL_VERIFY_PEER
+        elif n == CERT_REQUIRED:
+            mode = lib.SSL_VERIFY_PEER | lib.SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+        else:
+            raise ValueError("invalid value for verify_mode")
+        if mode == lib.SSL_VERIFY_NONE and self.check_hostname:
+            raise ValueError("Cannot set verify_mode to CERT_NONE when " \
+                             "check_hostname is enabled.")
+        lib.SSL_CTX_set_verify(self.ctx, mode, ffi.NULL);
+
+    @property
+    def verify_flags(self):
+        store = lib.SSL_CTX_get_cert_store(self.ctx)
+        param = lib._X509_STORE_get0_param(store)
+        flags = lib.X509_VERIFY_PARAM_get_flags(param)
+        return int(flags)
+
+    @verify_flags.setter
+    def verify_flags(self, value):
+        new_flags = int(value)
+        store = lib.SSL_CTX_get_cert_store(self.ctx);
+        param = lib._X509_STORE_get0_param(store)
+        flags = lib.X509_VERIFY_PARAM_get_flags(param);
+        clear = flags & ~new_flags;
+        set = ~flags & new_flags;
+        if clear:
+            param = lib._X509_STORE_get0_param(store)
+            if not lib.X509_VERIFY_PARAM_clear_flags(param, clear):
+                raise ssl_error(None, 0)
+        if set:
+            param = lib._X509_STORE_get0_param(store)
+            if not lib.X509_VERIFY_PARAM_set_flags(param, set):
+                raise ssl_error(None, 0)
 
     def set_ciphers(self, cipherlist):
         cipherlistbuf = _str_to_ffi_buffer(cipherlist)
