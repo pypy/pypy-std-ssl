@@ -1,4 +1,5 @@
 import sys
+import errno
 import time
 import _thread
 import weakref
@@ -6,7 +7,7 @@ from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.certificate import _test_decode_cert
 from openssl._stdssl.utility import _str_with_len
-from openssl._stdssl.error import (ssl_error,
+from openssl._stdssl.error import (ssl_error, ssl_lib_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
         SSLEOFError)
@@ -392,12 +393,12 @@ class _SSLContext(object):
                 if pw_info.operationerror:
                     lib.ERR_clear_error()
                     raise pw_info.operationerror
-                errno = ffi.errno
-                if errno:
+                _errno = ffi.errno
+                if _errno:
                     lib.ERR_clear_error()
-                    raise OSError(errno, '')
+                    raise OSError(_errno, "Error")
                 else:
-                    raise _ssl_seterror(None, -1)
+                    raise ssl_lib_error()
 
             keyfilebuf = _str_to_ffi_buffer(keyfile)
             ret = lib.SSL_CTX_use_PrivateKey_file(self.ctx, keyfilebuf,
@@ -406,12 +407,12 @@ class _SSLContext(object):
                 if pw_info.operationerror:
                     lib.ERR_clear_error()
                     raise pw_info.operationerror
-                errno = ffi.errno
-                if errno:
+                _errno = ffi.errno
+                if _errno:
                     lib.ERR_clear_error()
-                    raise OSError(errno, '')
+                    raise OSError(_errno, None)
                 else:
-                    raise _ssl_seterror(None, -1)
+                    raise ssl_lib_error()
 
             ret = lib.SSL_CTX_check_private_key(self.ctx)
             if ret != 1:
