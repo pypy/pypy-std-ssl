@@ -83,13 +83,37 @@ lib.SSL_library_init()
 lib.OpenSSL_add_all_algorithms()
 
 class PasswordInfo(object):
-    w_callable = None
+    callable = None
     password = None
     operationerror = None
 PWINFO_STORAGE = {}
 
 def _Cryptography_pem_password_cb(buf, size, rwflag, userdata):
-    pass
+    pw_info = ffi.from_handle(userdata)
+
+    # TODO PySSL_END_ALLOW_THREADS_S(pw_info->thread_state);
+    password = pw_info.password
+
+    if pw_info.callable:
+        try:
+            password = pw_info.callable()
+        except Exception as e:
+            pw_info.operationerror = e
+            return 0
+
+        if not isinstance(password, (str, bytes, bytearray)):
+            pw_info.operationerror = TypeError("password callback must return a string")
+            return 0
+
+    password = _str_to_ffi_buffer(password)
+
+    if (len(password) > size):
+        pw_info.operationerror = ValueError("password cannot be longer than %d bytes" % size)
+        return 0
+
+    #PySSL_BEGIN_ALLOW_THREADS_S(pw_info->thread_state);
+    ffi.memmove(buf, password, len(password))
+    return len(password)
 
 if lib.Cryptography_STATIC_CALLBACKS:
     ffi.def_extern(_Cryptography_pem_password_cb)
@@ -383,13 +407,13 @@ class _SSLContext(object):
             if callable(password):
                 pw_info.callable = password
             else:
-                if isinstance(password, str):
+                if isinstance(password, (str, bytes, bytearray)):
                     pw_info.password = password
                 else:
                     raise TypeError("password should be a string or callable")
 
             lib.SSL_CTX_set_default_passwd_cb(self.ctx, Cryptography_pem_password_cb)
-            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, ffi.cast("void*", index))
+            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, ffi.new_handle(pw_info))
 
         try:
             certfilebuf = _str_to_ffi_buffer(certfile)
