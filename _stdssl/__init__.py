@@ -88,9 +88,14 @@ class PasswordInfo(object):
     operationerror = None
 PWINFO_STORAGE = {}
 
-@ffi.def_extern
-def _password_callback(buf, size, rwflag, userdata):
+def _Cryptography_pem_password_cb(buf, size, rwflag, userdata):
     pass
+
+if lib.Cryptography_STATIC_CALLBACKS:
+    ffi.def_extern(_Cryptography_pem_password_cb)
+    Cryptography_pem_password_cb = lib.Cryptography_pem_password_cb
+else:
+    Cryptography_pem_password_cb = ffi.callback("int(char*,int,int,void*)")(_Cryptography_pem_password_cb)
 
 def _ssl_select(sock, write, timeout):
     pass
@@ -380,10 +385,10 @@ class _SSLContext(object):
             else:
                 if isinstance(password, str):
                     pw_info.password = password
+                else:
+                    raise TypeError("password should be a string or callable")
 
-                raise TypeError("password should be a string or callable")
-
-            lib.SSL_CTX_set_default_passwd_cb(self.ctx, _password_callback)
+            lib.SSL_CTX_set_default_passwd_cb(self.ctx, Cryptography_pem_password_cb)
             lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, ffi.cast("void*", index))
 
         try:
