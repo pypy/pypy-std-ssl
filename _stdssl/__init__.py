@@ -1,11 +1,11 @@
 import sys
-import errno
 import time
 import _thread
 import weakref
 from _openssl import ffi
 from _openssl import lib
-from openssl._stdssl.certificate import _test_decode_cert
+from openssl._stdssl.certificate import (_test_decode_cert,
+    _decode_certificate, _certificate_to_der)
 from openssl._stdssl.utility import _str_with_len
 from openssl._stdssl.error import (ssl_error, ssl_lib_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
@@ -254,10 +254,17 @@ class _SSLSocket(object):
         self.handshake_done = 1
         return None
 
-
+SSL_CTX_STATS_NAMES = """
+    number connect connect_good connect_renegotiate accept accept_good
+    accept_renegotiate hits misses timeouts cache_full""".split()
+SSL_CTX_STATS = []
+for name in SSL_CTX_STATS_NAMES:
+    attr = 'SSL_CTX_sess_'+name
+    assert hasattr(lib, attr)
+    SSL_CTX_STATS.append((name, getattr(lib, attr)))
 
 class _SSLContext(object):
-    __slots__ = ('ctx', 'check_hostname')
+    __slots__ = ('ctx', '_check_hostname', 'servername_callback')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -281,7 +288,7 @@ class _SSLContext(object):
         if self.ctx == ffi.NULL: 
             raise ssl_error("failed to allocate SSL context")
 
-        self.check_hostname = False
+        self._check_hostname = False
         # TODO self.register_finalizer(space)
 
         # Defaults
@@ -383,6 +390,18 @@ class _SSLContext(object):
             param = lib._X509_STORE_get0_param(store)
             if not lib.X509_VERIFY_PARAM_set_flags(param, set):
                 raise ssl_error(None, 0)
+
+    @property
+    def check_hostname(self):
+        return self._check_hostname
+
+    @check_hostname.setter
+    def check_hostname(self, value):
+        check_hostname = bool(value)
+        if check_hostname and lib.SSL_CTX_get_verify_mode(self.ctx) == lib.SSL_VERIFY_NONE:
+            raise ValueError("check_hostname needs a SSL context with either "
+                             "CERT_OPTIONAL or CERT_REQUIRED")
+        self._check_hostname = check_hostname
 
     def set_ciphers(self, cipherlist):
         cipherlistbuf = _str_to_ffi_buffer(cipherlist)
@@ -584,17 +603,17 @@ class _SSLContext(object):
 #        self = space.allocate_instance(SSLContext, w_subtype)
 #        self.__init__(space, protocol)
 #        return space.wrap(self)
-#    def session_stats_w(self, space):
-#        w_stats = space.newdict()
-#        for name, ssl_func in SSL_CTX_STATS:
-#            w_value = space.wrap(ssl_func(self.ctx))
-#            space.setitem_str(w_stats, name, w_value)
-#        return w_stats
-#
-#    def descr_set_default_verify_paths(self, space):
-#        if not libssl_SSL_CTX_set_default_verify_paths(self.ctx):
-#            raise ssl_error(space, "")
-#
+
+    def session_stats(self):
+        stats = {}
+        for name, ssl_func in SSL_CTX_STATS:
+            stats[name] = ssl_func(self.ctx)
+        return stats
+
+    def set_default_verify_paths(self):
+        if not lib.SSL_CTX_set_default_verify_paths(self.ctx):
+            raise ssl_error("")
+
 #    def descr_get_options(self, space):
 #        return space.newlong(libssl_SSL_CTX_get_options(self.ctx))
 #
@@ -668,31 +687,35 @@ class _SSLContext(object):
 #                        "CERT_OPTIONAL or CERT_REQUIRED")
 #        self.check_hostname = check_hostname
 #
-#    @unwrap_spec(filepath=str)
-#    def load_dh_params_w(self, space, filepath):
-#        bio = libssl_BIO_new_file(filepath, "r")
-#        if not bio:
-#            errno = get_saved_errno()
-#            libssl_ERR_clear_error()
-#            raise wrap_oserror(space, OSError(errno, ''),
-#                               exception_name = 'w_IOError')
-#        try:
-#            dh = libssl_PEM_read_bio_DHparams(bio, None, None, None)
-#        finally:
-#            libssl_BIO_free(bio)
-#        if not dh:
-#            errno = get_saved_errno()
-#            if errno != 0:
-#                libssl_ERR_clear_error()
-#                raise wrap_oserror(space, OSError(errno, ''))
-#            else:
-#                raise _ssl_seterror(space, None, 0)
-#        try:
-#            if libssl_SSL_CTX_set_tmp_dh(self.ctx, dh) == 0:
-#                raise _ssl_seterror(space, None, 0)
-#        finally:
-#            libssl_DH_free(dh)
-#
+    def load_dh_params(self, filepath):
+        if filepath is None:
+            raise TypeError("filepath must not be None")
+        buf = _str_to_ffi_buffer(filepath, zeroterm=True)
+        mode = ffi.new("char[]",b"r")
+        ffi.errno = 0
+        bio = lib.BIO_new_file(buf, mode)
+        if bio == ffi.NULL:
+            _errno = ffi.errno
+            lib.ERR_clear_error()
+            raise OSError(_errno, '')
+        ffi.errno = 0
+        try:
+            dh = lib.PEM_read_bio_DHparams(bio, ffi.NULL, ffi.NULL, ffi.NULL)
+        finally:
+            lib.BIO_free(bio)
+        if dh == ffi.NULL:
+            _errno = ffi.errno
+            if _errno != 0:
+                lib.ERR_clear_error()
+                raise OSError(_errno, '')
+            else:
+                raise ssl_lib_error()
+        try:
+            if lib.SSL_CTX_set_tmp_dh(self.ctx, dh) == 0:
+                raise ssl_lib_error()
+        finally:
+            lib.DH_free(dh)
+
 #    def cert_store_stats_w(self, space):
 #        store = libssl_SSL_CTX_get_cert_store(self.ctx)
 #        x509 = 0
@@ -737,63 +760,126 @@ class _SSLContext(object):
 #
 #        self.alpn_protocols = SSLAlpnProtocols(self.ctx, protos)
 #
-#    def get_ca_certs_w(self, space, w_binary_form=None):
-#        if w_binary_form and space.is_true(w_binary_form):
-#            binary_mode = True
-#        else:
-#            binary_mode = False
-#        rlist = []
-#        store = libssl_SSL_CTX_get_cert_store(self.ctx)
-#        for i in range(libssl_sk_X509_OBJECT_num(store[0].c_objs)):
-#            obj = libssl_sk_X509_OBJECT_value(store[0].c_objs, i)
-#            if intmask(obj.c_type) != X509_LU_X509:
-#                # not a x509 cert
-#                continue
-#            # CA for any purpose
-#            cert = libssl_pypy_X509_OBJECT_data_x509(obj)
-#            if not libssl_X509_check_ca(cert):
-#                continue
-#            if binary_mode:
-#                rlist.append(_certificate_to_der(space, cert))
-#            else:
-#                rlist.append(_decode_certificate(space, cert))
-#        return space.newlist(rlist)
-#
-#    @unwrap_spec(name=str)
-#    def set_ecdh_curve_w(self, space, name):
-#        nid = libssl_OBJ_sn2nid(name)
-#        if nid == 0:
-#            raise oefmt(space.w_ValueError,
-#                        "unknown elliptic curve name '%s'", name)
-#        key = libssl_EC_KEY_new_by_curve_name(nid)
-#        if not key:
-#            raise _ssl_seterror(space, None, 0)
-#        try:
-#            libssl_SSL_CTX_set_tmp_ecdh(self.ctx, key)
-#        finally:
-#            libssl_EC_KEY_free(key)
-#
-#    def set_servername_callback_w(self, space, w_callback):
-#        if space.is_none(w_callback):
-#            libssl_SSL_CTX_set_tlsext_servername_callback(
-#                self.ctx, lltype.nullptr(servername_cb.TO))
-#            self.servername_callback = None
-#            return
-#        if not space.is_true(space.callable(w_callback)):
-#            raise oefmt(space.w_TypeError, "not a callable object")
-#        callback_struct = ServernameCallback()
-#        callback_struct.space = space
-#        callback_struct.w_ctx = self
-#        callback_struct.w_set_hostname = w_callback
-#        self.servername_callback = callback_struct
-#        index = compute_unique_id(self)
-#        SERVERNAME_CALLBACKS.set(index, callback_struct)
-#        libssl_SSL_CTX_set_tlsext_servername_callback(
-#            self.ctx, _servername_callback)
-#        libssl_SSL_CTX_set_tlsext_servername_arg(self.ctx,
-#                                                 rffi.cast(rffi.VOIDP, index))
-#
-#
+    def get_ca_certs(self, binary_form=None):
+        binary_mode = bool(binary_form)
+        _list = []
+        store = lib.SSL_CTX_get_cert_store(self.ctx)
+        objs = store.objs
+        count = lib.sk_X509_OBJECT_num(objs)
+        for i in range(count):
+            obj = lib.sk_X509_OBJECT_value(objs, i)
+            _type = lib.Cryptography_X509_OBJECT_get_type(obj)
+            if _type != lib.Cryptography_X509_LU_X509:
+                # not a x509 cert
+                continue
+            # CA for any purpose
+            cert = lib.Cryptography_X509_OBJECT_data_x509(obj)
+            if not lib.X509_check_ca(cert):
+                continue
+            if binary_mode:
+                _list.append(_certificate_to_der(cert))
+            else:
+                _list.append(_decode_certificate(cert))
+        return _list
+
+    def set_ecdh_curve(self, name):
+        buf = _str_to_ffi_buffer(name, zeroterm=True)
+        nid = lib.OBJ_sn2nid(buf)
+        if nid == 0:
+            raise ValueError("unknown elliptic curve name '%s'" % name)
+        key = lib.EC_KEY_new_by_curve_name(nid)
+        if not key:
+            raise ssl_lib_error()
+        try:
+            lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
+        finally:
+            lib.EC_KEY_free(key)
+
+    def set_servername_callback(self, callback):
+        if callback is None:
+            lib.SSL_CTX_set_tlsext_servername_callback(self.ctx, ffi.NULL)
+            self.servername_callback = None
+            return
+        if not callable(callback):
+            raise TypeError("not a callable object")
+        callback_struct = ServernameCallback()
+        callback_struct.ctx = self
+        callback_struct.set_hostname = callback
+        self.servername_callback = callback_struct
+        index = id(self)
+        SERVERNAME_CALLBACKS[index] = callback_struct
+        lib.Cryptography_SSL_CTX_set_tlsext_servername_callback(self.ctx, _servername_callback)
+        lib.Cryptography_SSL_CTX_set_tlsext_servername_arg(self.ctx, ffi.new_handle(callback_struct))
+
+@ffi.callback("void(void)")
+def _servername_callback(ssl, ad, arg):
+    struct = ffi.from_handle(arg)
+    w_ctx = struct.w_ctx
+    space = struct.space
+    w_callback = struct.w_set_hostname
+    if not w_ctx.servername_callback:
+        # Possible race condition.
+        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_OK)
+    # The high-level ssl.SSLSocket object
+    index = rffi.cast(lltype.Signed, libssl_SSL_get_app_data(ssl))
+    w_ssl = SOCKET_STORAGE.get(index)
+    assert isinstance(w_ssl, SSLSocket)
+    # The servername callback expects an argument that represents the current
+    # SSL connection and that has a .context attribute that can be changed to
+    # identify the requested hostname. Since the official API is the Python
+    # level API we want to pass the callback a Python level object rather than
+    # a _ssl.SSLSocket instance. If there's an "owner" (typically an
+    # SSLObject) that will be passed. Otherwise if there's a socket then that
+    # will be passed. If both do not exist only then the C-level object is
+    # passed.
+    if w_ssl.w_owner is not None:
+        w_ssl_socket = w_ssl.w_owner()
+    elif w_ssl.w_socket is not None:
+        w_ssl_socket = w_ssl.w_socket()
+    else:
+        w_ssl_socket = w_ssl
+    if space.is_none(w_ssl_socket):
+        ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
+        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+
+    servername = libssl_SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
+    try:
+        if not servername:
+            w_result = space.call_function(w_callback,
+                                           w_ssl_socket, space.w_None, w_ctx)
+
+        else:
+            w_servername = space.newbytes(rffi.charp2str(servername))
+            try:
+                w_servername_idna = space.call_method(
+                    w_servername, 'decode', space.wrap('idna'))
+            except OperationError as e:
+                e.write_unraisable(space, "undecodable server name")
+                ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
+                return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+
+            w_result = space.call_function(w_callback,
+                                           w_ssl_socket,
+                                           w_servername_idna, w_ctx)
+    except OperationError as e:
+        e.write_unraisable(space, "in servername callback")
+        ad[0] = rffi.cast(rffi.INT, SSL_AD_HANDSHAKE_FAILURE)
+        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+
+    if space.is_none(w_result):
+        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_OK)
+    else:
+        try:
+            ad[0] = rffi.cast(rffi.INT, space.int_w(w_result))
+        except OperationError as e:
+            e.write_unraisable(space, "servername callback result")
+            ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
+        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+
+
+class ServernameCallback(object):
+    ctx = None
+SERVERNAME_CALLBACKS = weakref.WeakValueDictionary()
 
 def _str_from_buf(buf):
     return ffi.string(buf).decode('utf-8')
@@ -860,15 +946,22 @@ def RAND_pseudo_bytes(count):
 def RAND_bytes(count):
     return _RAND_bytes(count, False)
 
-def _str_to_ffi_buffer(view):
+def _str_to_ffi_buffer(view, zeroterm=False):
     # REVIEW unsure how to solve this. might be easy:
     # str does not support buffer protocol.
     # I think a user should really encode the string before it is 
     # passed here!
     if isinstance(view, str):
-        return ffi.from_buffer(view.encode())
+        enc = view.encode()
+        if zeroterm:
+            return ffi.from_buffer(enc + b'\x00')
+        else:
+            return ffi.from_buffer(enc)
     else:
-        return ffi.from_buffer(view)
+        if zeroterm:
+            return ffi.from_buffer(view + b'\x00')
+        else:
+            return ffi.from_buffer(view)
 
 def RAND_add(view, entropy):
     buf = _str_to_ffi_buffer(view)
