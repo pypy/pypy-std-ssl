@@ -6,7 +6,7 @@ from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.certificate import (_test_decode_cert,
     _decode_certificate, _certificate_to_der)
-from openssl._stdssl.utility import _str_with_len
+from openssl._stdssl.utility import _str_with_len, _bytes_with_len
 from openssl._stdssl.error import (ssl_error, ssl_lib_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
@@ -921,7 +921,68 @@ def nid2obj(nid):
                                                                
 
 class MemoryBIO(object):
-    pass # TODO
+    def __init__(self):
+        bio = lib.BIO_new(lib.BIO_s_mem());
+        if bio == ffi.NULL:
+            raise ssl_error("failed to allocate BIO")
+
+        # Since our BIO is non-blocking an empty read() does not indicate EOF,
+        # just that no data is currently available. The SSL routines should retry
+        # the read, which we can achieve by calling BIO_set_retry_read().
+        lib.BIO_set_retry_read(bio);
+        lib.BIO_set_mem_eof_return(bio, -1);
+
+        self.bio = bio;
+        self.eof_written = False
+
+    @property
+    def eof(self):
+        """Whether the memory BIO is at EOF."""
+        return lib.BIO_ctrl_pending(self.bio) == 0 and self.eof_written
+
+    def write(self, _bytes):
+        INT_MAX = 2**31-1
+        if isinstance(_bytes, memoryview):
+            # REVIEW pypy does not support from_buffer of a memoryview
+            # copies the data!
+            _bytes = bytes(_bytes)
+        buf = ffi.from_buffer(_bytes)
+        if len(buf) > INT_MAX:
+            raise OverflowError("string longer than %d bytes", INT_MAX)
+
+        if self.eof_written:
+            raise ssl_error("cannot write() after write_eof()")
+        nbytes = lib.BIO_write(self.bio, buf, len(buf));
+        if nbytes < 0:
+            raise ssl_lib_error()
+        return nbytes
+
+    def write_eof(self):
+        self.eof_written = True
+        # After an EOF is written, a zero return from read() should be a real EOF
+        # i.e. it should not be retried. Clear the SHOULD_RETRY flag.
+        lib.BIO_clear_retry_flags(self.bio)
+        lib.BIO_set_mem_eof_return(self.bio, 0)
+
+    def read(self, len=-1):
+        count = len
+        avail = lib.BIO_ctrl_pending(self.bio);
+        if count < 0 or count > avail:
+            count = avail;
+
+        buf = ffi.new("char[%d]" % count)
+
+        nbytes = lib.BIO_read(self.bio, buf, count);
+        #  There should never be any short reads but check anyway.
+        if nbytes < count:
+            return b""
+
+        return _bytes_with_len(buf, nbytes)
+
+    @property
+    def pending(self):
+        return lib.BIO_ctrl_pending(self.bio)
+
 
 RAND_status = lib.RAND_status
 RAND_add = lib.RAND_add

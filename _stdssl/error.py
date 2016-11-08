@@ -3,6 +3,9 @@ from _openssl import lib
 
 class SSLError(OSError):
     """ An error occurred in the SSL implementation. """
+    def __str__(self):
+        return self.strerror
+
 
 class SSLZeroReturnError(SSLError):
     """ SSL/TLS session closed cleanly. """
