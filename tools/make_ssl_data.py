@@ -68,12 +68,9 @@ if __name__ == "__main__":
     w("")
     w("from _openssl import ffi, lib ")
 
-    #w("static struct py_ssl_library_code library_codes[] = {")
-    #for mnemo, (libcode, _, _) in sorted(error_libraries.items()):
-    #    w('    {"%s", %s},' % (mnemo, libcode))
-    #w('    { NULL }')
-    #w('};')
-    #w("")
+    w("_lib_codes = []")
+    for mnemo, (libcode, _, _) in sorted(error_libraries.items()):
+        w('_lib_codes.append(("%s", lib.%s))' % (mnemo, libcode))
 
     w("_error_codes = []")
     for errcode, (libcode, name, num) in sorted(codes.items()):

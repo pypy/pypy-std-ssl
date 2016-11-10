@@ -4,8 +4,9 @@ from _openssl import lib
 class SSLError(OSError):
     """ An error occurred in the SSL implementation. """
     def __str__(self):
-        return self.strerror
-
+        if self.strerror and isinstance(self.strerror, str):
+            return self.strerror
+        return str(self.args)
 
 class SSLZeroReturnError(SSLError):
     """ SSL/TLS session closed cleanly. """
@@ -28,6 +29,7 @@ class SSLEOFError(SSLError):
 
 def ssl_lib_error():
     errcode = lib.ERR_peek_last_error()
+    lib.ERR_clear_error()
     return ssl_error(None, 0, None, errcode)
 
 def ssl_error(msg, errno=0, errtype=None, errcode=0):
@@ -46,30 +48,29 @@ def ssl_error(msg, errno=0, errtype=None, errcode=0):
     elif lib_str:
         msg = "[%s] %s" % (lib_str, msg)
 
-    raise SSLError(msg)
-    #w_exception_class = w_errtype or get_error(space).w_error
-    #if errno or errcode:
-    #    w_exception = space.call_function(w_exception_class,
-    #                                      space.wrap(errno), space.wrap(msg))
-    #else:
-    #    w_exception = space.call_function(w_exception_class, space.wrap(msg))
-    #space.setattr(w_exception, space.wrap("reason"),
-    #              space.wrap(reason_str) if reason_str else space.w_None)
-    #space.setattr(w_exception, space.wrap("library"),
-    #              space.wrap(lib_str) if lib_str else space.w_None)
-    #return OperationError(w_exception_class, w_exception)
+    if errno or errcode:
+        error = SSLError(errno, msg)
+    else:
+        error = SSLError(msg)
+    error.reason = reason_str if reason_str else None
+    error.library = lib_str if lib_str else None
+    return error
 
 ERR_CODES_TO_NAMES = {}
 ERR_NAMES_TO_CODES = {}
 LIB_CODES_TO_NAMES = {}
 
-from openssl._stdssl.errorcodes import _error_codes
+from openssl._stdssl.errorcodes import _error_codes, _lib_codes
 
 for mnemo, library, reason in _error_codes:
     key = (library, reason)
     assert mnemo is not None and key is not None
     ERR_CODES_TO_NAMES[key] = mnemo
     ERR_NAMES_TO_CODES[mnemo] = key
+
+
+for mnemo, number in _lib_codes:
+    LIB_CODES_TO_NAMES[number] = mnemo
 
 def _fill_and_raise_ssl_error(error, errcode):
     pass
