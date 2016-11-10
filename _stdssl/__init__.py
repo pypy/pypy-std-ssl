@@ -1,6 +1,7 @@
 import sys
 import time
 import _thread
+import socket
 import weakref
 from _openssl import ffi
 from _openssl import lib
@@ -133,7 +134,8 @@ def _ssl_select(sock, writing, timeout):
     if sock is None or timeout == 0:
         return SOCKET_IS_NONBLOCKING
     elif timeout < 0:
-        if sock.get_timeout() > 0:
+        t = sock.gettimeout() or 0
+        if t > 0:
             return SOCKET_HAS_TIMED_OUT
         else:
             return SOCKET_IS_BLOCKING
@@ -169,6 +171,9 @@ SOCKET_HAS_TIMED_OUT = 2
 SOCKET_HAS_BEEN_CLOSED = 3
 SOCKET_TOO_LARGE_FOR_SELECT = 4
 SOCKET_OPERATION_OK = 5
+
+def _buffer_new(length):
+    return ffi.new("char[%d]"%length)
 
 class _SSLSocket(object):
 
@@ -209,7 +214,8 @@ class _SSLSocket(object):
         # If the socket is in non-blocking mode or timeout mode, set the BIO
         # to non-blocking mode (blocking is the default)
         #
-        if sock and sock.gettimeout() >= 0:
+        timeout = sock.gettimeout() or 0
+        if sock and timeout >= 0:
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), 1)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), 1)
 
@@ -250,7 +256,7 @@ class _SSLSocket(object):
         ssl = self.ssl
         timeout = 0
         if sock:
-            timeout = sock.gettimeout()
+            timeout = sock.gettimeout() or 0
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
@@ -319,6 +325,134 @@ class _SSLSocket(object):
                 return {}
             else:
                 return _decode_certificate(self.peer_cert)
+
+    def write(self, bytestring):
+        deadline = 0
+        b = _str_to_ffi_buffer(bytestring)
+        sock = self.socket()
+        ssl = self.ssl
+        if sock:
+            timeout = sock.gettimeout() or 0
+            nonblocking = timeout >= 0
+            lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
+            lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
+
+        timeout = sock.gettimeout() or 0
+        has_timeout = timeout > 0
+        if has_timeout:
+            # TODO monotonic clock?
+            deadline = time.time() + timeout
+
+        sockstate = _ssl_select(sock, 1, timeout)
+        if sockstate == SOCKET_HAS_TIMED_OUT:
+            raise socket.TimeoutError("The write operation timed out")
+        elif sockstate == SOCKET_HAS_BEEN_CLOSED:
+            raise ssl_error("Underlying socket has been closed.")
+        elif sockstate == SOCKET_TOO_LARGE_FOR_SELECT:
+            raise ssl_error("Underlying socket too large for select().")
+
+        while True:
+            #PySSL_START_ALLOW_THREADS
+            length = lib.SSL_write(self.ssl, b, len(b))
+            err = lib.SSL_get_error(self.ssl, length)
+            #PySSL_END_ALLOW_THREADS
+
+            # TODO if (PyErr_CheckSignals())
+            # TODO     goto error;
+
+            if has_timeout:
+                # TODO monotonic clock
+                timeout = deadline - time.time()
+
+            if err == lib.SSL_ERROR_WANT_READ:
+                sockstate = _ssl_select(sock, 0, timeout)
+            elif err == lib.SSL_ERROR_WANT_WRITE:
+                sockstate = _ssl_select(sock, 1, timeout)
+            else:
+                sockstate = SOCKET_OPERATION_OK
+
+            if sockstate == SOCKET_HAS_TIMED_OUT:
+                raise socket.TimeoutError("The write operation timed out")
+            elif sockstate == SOCKET_HAS_BEEN_CLOSED:
+                raise ssl_error("Underlying socket has been closed.")
+            elif sockstate == SOCKET_IS_NONBLOCKING:
+                break
+            if not (err == lib.SSL_ERROR_WANT_READ or err == lib.SSL_ERROR_WANT_WRITE):
+                break
+
+        if length > 0:
+            return length
+        else:
+            raise ssl_lib_error()
+            # return PySSL_SetError(self, len, __FILE__, __LINE__);
+
+    def read(self, length, group_right_1=0, buffer_into=None):
+        sock = self.socket()
+        ssl = self.ssl
+
+        if sock is None:
+            raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
+
+        if not group_right_1:
+            dest = _buffer_new(length)
+            # TODO ? mem = PyBytes_AS_STRING(dest);
+            mem = dest
+        else:
+            # TODO
+            mem = buffer_into.buf;
+            if length <= 0 or length > len(buffer_into):
+                if len(buffer_into) != len:
+                    raise OverflowError("maximum length can't fit in a C 'int'")
+
+        if sock:
+            timeout = sock.gettimeout() or 0
+            nonblocking = timeout >= 0
+            lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
+            lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
+
+        deadline = 0
+        timeout = sock.gettimeout() or 0
+        has_timeout = timeout > 0
+        if has_timeout:
+            # TODO monotonic clock?
+            deadline = time.time() + timeout
+
+        shutdown = False
+        while True:
+            #PySSL_BEGIN_ALLOW_THREADS
+            count = lib.SSL_read(self.ssl, mem, length);
+            err = lib.SSL_get_error(self.ssl, count);
+            #PySSL_END_ALLOW_THREADS
+
+            # TODO
+            #if (PyErr_CheckSignals())
+            #    goto error;
+
+            if has_timeout:
+                timeout = deadline - time.time() # TODO ? _PyTime_GetMonotonicClock();
+
+            if err == lib.SSL_ERROR_WANT_READ:
+                sockstate = _ssl_select(sock, 0, timeout)
+            elif err == lib.SSL_ERROR_WANT_WRITE:
+                sockstate = _ssl_select(sock, 1, timeout)
+            elif err == lib.SSL_ERROR_ZERO_RETURN and \
+                 lib.SSL_get_shutdown(self.ssl) == SSL_RECEIVED_SHUTDOWN:
+                shutdown = True
+                break;
+            else:
+                sockstate = SOCKET_OPERATION_OK
+
+            if sockstate == SOCKET_HAS_TIMED_OUT:
+                raise socket.TimeoutError("The read operation timed out")
+            elif sockstate == SOCKET_IS_NONBLOCKING:
+                break
+            if not (err == lib.SSL_ERROR_WANT_READ or err == lib.SSL_ERROR_WANT_WRITE):
+                break
+
+        if count <= 0:
+            raise ssl_error("", errocode=count)
+
+        return count
 
 SSL_CTX_STATS_NAMES = """
     number connect connect_good connect_renegotiate accept accept_good
