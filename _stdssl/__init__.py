@@ -12,6 +12,11 @@ from openssl._stdssl.error import (ssl_error, ssl_lib_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
         SSLEOFError)
+from openssl._stdssl.error import (SSL_ERROR_NONE,
+        SSL_ERROR_SSL, SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE,
+        SSL_ERROR_WANT_X509_LOOKUP, SSL_ERROR_SYSCALL,
+        SSL_ERROR_ZERO_RETURN, SSL_ERROR_WANT_CONNECT,
+        SSL_ERROR_EOF, SSL_ERROR_NO_SOCKET, SSL_ERROR_INVALID_ERROR_CODE)
 
 
 OPENSSL_VERSION = ffi.string(lib.OPENSSL_VERSION_TEXT).decode('utf-8')
@@ -252,7 +257,7 @@ class _SSLSocket(object):
     def do_handshake(self):
         sock = self.socket()
         if sock is None:
-            raise ssl_error("Underlying socket connection gone", lib.SSL_ERROR_NO_SOCKET)
+            raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
         ssl = self.ssl
         timeout = 0
         if sock:
@@ -282,9 +287,9 @@ class _SSLSocket(object):
                 # REIVIEW monotonic clock?
                 timeout = deadline - time.time()
 
-            if err == lib.SSL_ERROR_WANT_READ:
+            if err == SSL_ERROR_WANT_READ:
                 sockstate = _ssl_select(sock, 0, timeout)
-            elif err == lib.SSL_ERROR_WANT_WRITE:
+            elif err == SSL_ERROR_WANT_WRITE:
                 sockstate = _ssl_select(sock, 1, timeout)
             else:
                 sockstate = SOCKET_OPERATION_OK
@@ -297,7 +302,7 @@ class _SSLSocket(object):
                 raise SSLError("Underlying socket too large for select().")
             elif sockstate == SOCKET_IS_NONBLOCKING:
                 break
-            if not (err == lib.SSL_ERROR_WANT_READ or err == lib.SSL_ERROR_WANT_WRITE):
+            if not (err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE):
                 break
         if ret < 1:
             raise ssl_lib_error()
@@ -364,9 +369,9 @@ class _SSLSocket(object):
                 # TODO monotonic clock
                 timeout = deadline - time.time()
 
-            if err == lib.SSL_ERROR_WANT_READ:
+            if err == SSL_ERROR_WANT_READ:
                 sockstate = _ssl_select(sock, 0, timeout)
-            elif err == lib.SSL_ERROR_WANT_WRITE:
+            elif err == SSL_ERROR_WANT_WRITE:
                 sockstate = _ssl_select(sock, 1, timeout)
             else:
                 sockstate = SOCKET_OPERATION_OK
@@ -377,7 +382,7 @@ class _SSLSocket(object):
                 raise ssl_error("Underlying socket has been closed.")
             elif sockstate == SOCKET_IS_NONBLOCKING:
                 break
-            if not (err == lib.SSL_ERROR_WANT_READ or err == lib.SSL_ERROR_WANT_WRITE):
+            if not (err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE):
                 break
 
         if length > 0:
@@ -431,12 +436,12 @@ class _SSLSocket(object):
             if has_timeout:
                 timeout = deadline - time.time() # TODO ? _PyTime_GetMonotonicClock();
 
-            if err == lib.SSL_ERROR_WANT_READ:
+            if err == SSL_ERROR_WANT_READ:
                 sockstate = _ssl_select(sock, 0, timeout)
-            elif err == lib.SSL_ERROR_WANT_WRITE:
+            elif err == SSL_ERROR_WANT_WRITE:
                 sockstate = _ssl_select(sock, 1, timeout)
-            elif err == lib.SSL_ERROR_ZERO_RETURN and \
-                 lib.SSL_get_shutdown(self.ssl) == SSL_RECEIVED_SHUTDOWN:
+            elif err == SSL_ERROR_ZERO_RETURN and \
+                 lib.SSL_get_shutdown(self.ssl) == lib.SSL_RECEIVED_SHUTDOWN:
                 shutdown = True
                 break;
             else:
@@ -446,13 +451,91 @@ class _SSLSocket(object):
                 raise socket.TimeoutError("The read operation timed out")
             elif sockstate == SOCKET_IS_NONBLOCKING:
                 break
-            if not (err == lib.SSL_ERROR_WANT_READ or err == lib.SSL_ERROR_WANT_WRITE):
+            if not (err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE):
                 break
 
         if count <= 0:
-            raise ssl_error("", errocode=count)
+            raise ssl_error("", errcode=count)
+
+        if not group_right_1:
+            return _bytes_with_len(dest, count)
 
         return count
+
+    def selected_alpn_protocol(self):
+        out = ffi.new("const unsigned char **")
+        outlen = ffi.new("unsigned int*")
+
+        lib.SSL_get0_alpn_selected(self.ssl, out, outlen);
+        if out == ffi.NULL:
+            return None
+        return _str_with_len(ffi.cast("char*",out[0]), outlen[0]);
+
+    def shared_ciphers(self):
+        sess = lib.SSL_get_session(self.ssl)
+
+        ciphers = lib.Cryptography_get_ssl_session_ciphers(sess)
+        if sess is None or ciphers == ffi.NULL:
+            return None
+        res = []
+        count = lib.sk_SSL_CIPHER_num(ciphers)
+        for i in range(count):
+            tup = cipher_to_tuple(lib.sk_SSL_CIPHER_value(ciphers, i))
+            if not tup:
+                return None
+            res.append(tup)
+        return res
+
+    def cipher(self):
+        if self.ssl == ffi.NULL:
+            return None
+        current = lib.SSL_get_current_cipher(self.ssl)
+        if current == ffi.NULL:
+            return None
+        return cipher_to_tuple(current)
+
+    def compression(self):
+        if not lib.Cryptography_HAS_COMPRESSION or self.ssl == ffi.NULL:
+            return None
+
+        comp_method = lib.SSL_get_current_compression(self.ssl);
+        if comp_method == ffi.NULL: # or comp_method.type == lib.NID_undef:
+            return None
+        short_name = lib.SSL_COMP_get_name(comp_method)
+        if short_name == ffi.NULL:
+            return None
+        return _fs_decode(_str_from_buf(short_name))
+
+    def version(self):
+        if self.ssl == ffi.NULL:
+            return None
+        version = _str_from_buf(lib.SSL_get_version(self.ssl))
+        if version == "unknown":
+            return None
+        return version
+
+def _fs_decode(name):
+    # TODO return PyUnicode_DecodeFSDefault(short_name);
+    return name.decode('utf-8')
+
+
+def cipher_to_tuple(cipher):
+    ccipher_name = lib.SSL_CIPHER_get_name(cipher)
+    if ccipher_name == ffi.NULL:
+        cipher_name = None
+    else:
+        cipher_name = _str_from_buf(ccipher_name)
+
+    ccipher_protocol = lib.SSL_CIPHER_get_version(cipher)
+    if ccipher_protocol == ffi.NULL:
+        cipher_protocol = None
+    else:
+        cipher_protocol = _str_from_buf(ccipher_protocol)
+
+    bits = lib.SSL_CIPHER_get_bits(cipher, ffi.NULL)
+    return (cipher_name, cipher_protocol, bits)
+
+
 
 SSL_CTX_STATS_NAMES = """
     number connect connect_good connect_renegotiate accept accept_good
@@ -1173,6 +1256,10 @@ def _str_to_ffi_buffer(view, zeroterm=False):
         else:
             return ffi.from_buffer(enc)
     else:
+        if isinstance(view, memoryview):
+            # TODO pypy limitation StringBuffer does not allow
+            # to get a raw address to the string!
+            view = bytes(view)
         if zeroterm:
             return ffi.from_buffer(view + b'\x00')
         else:

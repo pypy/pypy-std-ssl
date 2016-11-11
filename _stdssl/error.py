@@ -1,6 +1,19 @@
 from _openssl import ffi
 from _openssl import lib
 
+SSL_ERROR_NONE = 0
+SSL_ERROR_SSL = 1
+SSL_ERROR_WANT_READ = 2
+SSL_ERROR_WANT_WRITE = 3
+SSL_ERROR_WANT_X509_LOOKUP = 4
+SSL_ERROR_SYSCALL = 5
+SSL_ERROR_ZERO_RETURN = 6
+SSL_ERROR_WANT_CONNECT = 7
+# start of non ssl.h errorcodes
+SSL_ERROR_EOF = 8 # special case of SSL_ERROR_SYSCALL
+SSL_ERROR_NO_SOCKET = 9 # socket has been GC'd
+SSL_ERROR_INVALID_ERROR_CODE = 10
+
 class SSLError(OSError):
     """ An error occurred in the SSL implementation. """
     def __str__(self):
