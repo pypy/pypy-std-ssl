@@ -1,6 +1,8 @@
 from _openssl import ffi
 from _openssl import lib
 
+from openssl._stdssl.utility import _string_from_asn1, _str_to_ffi_buffer
+
 SSL_ERROR_NONE = 0
 SSL_ERROR_SSL = 1
 SSL_ERROR_WANT_READ = 2
@@ -103,9 +105,8 @@ def _last_error():
     #return ffi.string(buf).decode()
 
 
-def _ssl_seterror(ss, ret):
-    assert ret <= 0
-
+# the PySSL_SetError equivalent
+def ssl_socket_error(ss, ret):
     errcode = lib.ERR_peek_last_error()
 
     if ss is None:
@@ -114,30 +115,31 @@ def _ssl_seterror(ss, ret):
         err = lib.SSL_get_error(ss.ssl, ret)
     else:
         err = SSL_ERROR_SSL
-    w_errtype = None
     errstr = ""
     errval = 0
+    errtype = SSLError
 
     if err == SSL_ERROR_ZERO_RETURN:
-        w_errtype = get_error(space).w_ZeroReturnError
+        errtype = ZeroReturnError
         errstr = "TLS/SSL connection has been closed"
-        errval = PY_SSL_ERROR_ZERO_RETURN
+        errval = SSL_ERROR_ZERO_RETURN
     elif err == SSL_ERROR_WANT_READ:
-        w_errtype = get_error(space).w_WantReadError
+        errtype = WantReadError
         errstr = "The operation did not complete (read)"
-        errval = PY_SSL_ERROR_WANT_READ
+        errval = SSL_ERROR_WANT_READ
     elif err == SSL_ERROR_WANT_WRITE:
-        w_errtype = get_error(space).w_WantWriteError
+        errtype = WantWriteError
         errstr = "The operation did not complete (write)"
-        errval = PY_SSL_ERROR_WANT_WRITE
+        errval = SSL_ERROR_WANT_WRITE
     elif err == SSL_ERROR_WANT_X509_LOOKUP:
         errstr = "The operation did not complete (X509 lookup)"
-        errval = PY_SSL_ERROR_WANT_X509_LOOKUP
+        errval = SSL_ERROR_WANT_X509_LOOKUP
     elif err == SSL_ERROR_WANT_CONNECT:
         errstr = "The operation did not complete (connect)"
-        errval = PY_SSL_ERROR_WANT_CONNECT
+        errval = SSL_ERROR_WANT_CONNECT
     elif err == SSL_ERROR_SYSCALL:
-        e = libssl_ERR_get_error()
+        xxx
+        e = lib.ERR_get_error()
         if e == 0:
             if ret == 0 or ss.w_socket() is None:
                 w_errtype = get_error(space).w_EOFError
@@ -155,15 +157,14 @@ def _ssl_seterror(ss, ret):
             errstr = rffi.charp2str(libssl_ERR_error_string(e, None))
             errval = PY_SSL_ERROR_SYSCALL
     elif err == SSL_ERROR_SSL:
-        errval = PY_SSL_ERROR_SSL
+        errval = SSL_ERROR_SSL
         if errcode != 0:
-            errstr = rffi.charp2str(libssl_ERR_error_string(errcode, None))
+            errstr = _str_to_ffi_buffer(lib.ERR_error_string(errcode, ffi.NULL))
         else:
             errstr = "A failure in the SSL library occurred"
     else:
         errstr = "Invalid error code"
-        errval = PY_SSL_ERROR_INVALID_ERROR_CODE
+        errval = SSL_ERROR_INVALID_ERROR_CODE
 
-    return ssl_error(space, errstr, errval, w_errtype=w_errtype,
-                     errcode=errcode)
+    return errtype(errstr, errval)
 

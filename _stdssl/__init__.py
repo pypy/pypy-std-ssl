@@ -7,8 +7,8 @@ from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.certificate import (_test_decode_cert,
     _decode_certificate, _certificate_to_der)
-from openssl._stdssl.utility import _str_with_len, _bytes_with_len
-from openssl._stdssl.error import (ssl_error, ssl_lib_error,
+from openssl._stdssl.utility import _str_with_len, _bytes_with_len, _str_to_ffi_buffer
+from openssl._stdssl.error import (ssl_error, ssl_lib_error, ssl_socket_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
         SSLEOFError)
@@ -245,6 +245,7 @@ class _SSLSocket(object):
         self.handshake_done = 0
         self.owner = None
         self.server_hostname = None
+        self.socket = None
 
     @property
     def context(self):
@@ -255,7 +256,7 @@ class _SSLSocket(object):
         self.ctx = value
 
     def do_handshake(self):
-        sock = self.socket()
+        sock = self.get_socket_or_None()
         if sock is None:
             raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
         ssl = self.ssl
@@ -263,11 +264,11 @@ class _SSLSocket(object):
         if sock:
             timeout = sock.gettimeout() or 0
             nonblocking = timeout >= 0
+            nonblocking = False
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
         has_timeout = timeout > 0
-        has_timeout = (timeout > 0);
         deadline = -1
         if has_timeout:
             # REVIEW, cpython uses a monotonic clock here
@@ -279,6 +280,8 @@ class _SSLSocket(object):
             ret = lib.SSL_do_handshake(ssl)
             err = lib.SSL_get_error(ssl, ret)
             # end allow threads
+
+            import pdb; pdb.set_trace()
 
             #if (PyErr_CheckSignals())
             #    goto error;
@@ -334,7 +337,7 @@ class _SSLSocket(object):
     def write(self, bytestring):
         deadline = 0
         b = _str_to_ffi_buffer(bytestring)
-        sock = self.socket()
+        sock = self.get_socket_or_None()
         ssl = self.ssl
         if sock:
             timeout = sock.gettimeout() or 0
@@ -391,22 +394,20 @@ class _SSLSocket(object):
             raise ssl_lib_error()
             # return PySSL_SetError(self, len, __FILE__, __LINE__);
 
-    def read(self, length, group_right_1=0, buffer_into=None):
-        sock = self.socket()
+    def read(self, length, buffer_into=None):
+        sock = self.get_socket_or_None()
         ssl = self.ssl
 
         if sock is None:
             raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
 
-        if not group_right_1:
+        if not buffer_into:
             dest = _buffer_new(length)
-            # TODO ? mem = PyBytes_AS_STRING(dest);
             mem = dest
         else:
-            # TODO
-            mem = buffer_into.buf;
+            mem = ffi.from_buffer(buffer_into)
             if length <= 0 or length > len(buffer_into):
-                if len(buffer_into) != len:
+                if len(buffer_into) != length:
                     raise OverflowError("maximum length can't fit in a C 'int'")
 
         if sock:
@@ -455,9 +456,9 @@ class _SSLSocket(object):
                 break
 
         if count <= 0:
-            raise ssl_error("", errcode=count)
+            raise ssl_socket_error(self, err)
 
-        if not group_right_1:
+        if not buffer_into:
             return _bytes_with_len(dest, count)
 
         return count
@@ -513,6 +514,97 @@ class _SSLSocket(object):
         if version == "unknown":
             return None
         return version
+
+    def get_socket_or_None(self):
+        if self.socket is None:
+            return None
+        return self.socket()
+
+    def shutdown(self):
+        sock = self.get_socket_or_None()
+        nonblocking = False
+        ssl = self.ssl
+
+        if sock is not None:
+            # Guard against closed socket
+            if sock.fileno() < 0:
+                raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
+
+            timeout = sock.gettimeout() or 0
+            nonblocking = timeout >= 0
+            if sock and timeout >= 0:
+                lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
+                lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
+        else:
+            timeout = 0
+
+        has_timeout = (timeout > 0);
+        if has_timeout:
+            # TODO monotonic clock
+            deadline = time.time() + timeout;
+
+        zeros = 0
+
+        while True:
+            # TODO PySSL_BEGIN_ALLOW_THREADS
+            # Disable read-ahead so that unwrap can work correctly.
+            # Otherwise OpenSSL might read in too much data,
+            # eating clear text data that happens to be
+            # transmitted after the SSL shutdown.
+            # Should be safe to call repeatedly every time this
+            # function is used and the shutdown_seen_zero != 0
+            # condition is met.
+            #
+            if self.shutdown_seen_zero:
+                lib.SSL_set_read_ahead(self.ssl, 0)
+            err = lib.SSL_shutdown(self.ssl)
+            # TODO PySSL_END_ALLOW_THREADS
+
+            # If err == 1, a secure shutdown with SSL_shutdown() is complete
+            if err > 0:
+                break
+            if err == 0:
+                # Don't loop endlessly; instead preserve legacy
+                #   behaviour of trying SSL_shutdown() only twice.
+                #   This looks necessary for OpenSSL < 0.9.8m
+                zeros += 1
+                if zeros > 1:
+                    break
+                # Shutdown was sent, now try receiving
+                self.shutdown_seen_zero = 1
+                continue
+
+            if has_timeout:
+                # TODO monotonic clock
+                timeout = deadline - time.time() #_PyTime_GetMonotonicClock();
+
+            # Possibly retry shutdown until timeout or failure
+            ssl_err = lib.SSL_get_error(self.ssl, err)
+            if ssl_err == SSL_ERROR_WANT_READ:
+                sockstate = _ssl_select(sock, 0, timeout)
+            elif ssl_err == SSL_ERROR_WANT_WRITE:
+                sockstate = _ssl_select(sock, 1, timeout)
+            else:
+                break
+
+            if sockstate == SOCKET_HAS_TIMED_OUT:
+                if ssl_err == SSL_ERROR_WANT_READ:
+                    raise socket.TimeoutError("The read operation timed out")
+                else:
+                    raise socket.TimeoutError("The write operation timed out")
+            elif sockstate == SOCKET_TOO_LARGE_FOR_SELECT:
+                raise ssl_error("Underlying socket too large for select().")
+            elif sockstate != SOCKET_OPERATION_OK:
+                # Retain the SSL error code
+                break;
+
+        if err < 0:
+            raise ssl_socket_error(self, err)
+        if sock:
+            return sock
+        else:
+            return None
+
 
 def _fs_decode(name):
     # TODO return PyUnicode_DecodeFSDefault(short_name);
@@ -1220,7 +1312,6 @@ class MemoryBIO(object):
     def pending(self):
         return lib.BIO_ctrl_pending(self.bio)
 
-
 RAND_status = lib.RAND_status
 RAND_add = lib.RAND_add
 
@@ -1243,27 +1334,6 @@ def RAND_pseudo_bytes(count):
 
 def RAND_bytes(count):
     return _RAND_bytes(count, False)
-
-def _str_to_ffi_buffer(view, zeroterm=False):
-    # REVIEW unsure how to solve this. might be easy:
-    # str does not support buffer protocol.
-    # I think a user should really encode the string before it is 
-    # passed here!
-    if isinstance(view, str):
-        enc = view.encode()
-        if zeroterm:
-            return ffi.from_buffer(enc + b'\x00')
-        else:
-            return ffi.from_buffer(enc)
-    else:
-        if isinstance(view, memoryview):
-            # TODO pypy limitation StringBuffer does not allow
-            # to get a raw address to the string!
-            view = bytes(view)
-        if zeroterm:
-            return ffi.from_buffer(view + b'\x00')
-        else:
-            return ffi.from_buffer(view)
 
 def RAND_add(view, entropy):
     buf = _str_to_ffi_buffer(view)
