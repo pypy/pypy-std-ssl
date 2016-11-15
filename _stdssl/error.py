@@ -117,7 +117,7 @@ def pyssl_error(obj, ret):
         elif err == SSL_ERROR_SSL:
             errval = SSL_ERROR_SSL
             if errcode != 0:
-                errstr = _str_to_ffi_buffer(lib.ERR_error_string(errcode, ffi.NULL))
+                errstr = _str_from_buf(lib.ERR_error_string(errcode, ffi.NULL))
             else:
                 errstr = "A failure in the SSL library occurred"
         else:
@@ -139,11 +139,11 @@ def fill_sslerror(errtype, ssl_errno, errstr, errcode):
     if not errstr:
         msg = "unknown error"
     if reason_str and lib_str:
-        msg = "[%s: %s] %s" % (lib_str, reason_str, msg)
+        msg = "[%s: %s] %s" % (lib_str, reason_str, errstr)
     elif lib_str:
-        msg = "[%s] %s" % (lib_str, msg)
+        msg = "[%s] %s" % (lib_str, errstr)
 
-    err_value = errtype(ssl_errno, errtype)
+    err_value = errtype(ssl_errno, msg)
     err_value.reason = reason_str if reason_str else None
     err_value.library = lib_str if lib_str else None
     return err_value

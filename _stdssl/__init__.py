@@ -257,6 +257,8 @@ class _SSLSocket(object):
         self.owner = None
         self.server_hostname = None
         self.socket = None
+        self.alpn_protocols = ffi.NULL
+        self.npn_protocols = ffi.NULL
 
     @property
     def context(self):
@@ -483,9 +485,9 @@ class _SSLSocket(object):
             outlen = ffi.new("unsigned int*")
 
             lib.SSL_get0_alpn_selected(self.ssl, out, outlen);
-            if out == ffi.NULL:
+            if out[0] == ffi.NULL:
                 return None
-            return _str_with_len(ffi.cast("char*",out[0]), outlen[0]);
+            return _str_with_len(out[0], outlen[0]);
 
     def shared_ciphers(self):
         sess = lib.SSL_get_session(self.ssl)
@@ -693,7 +695,8 @@ for name in SSL_CTX_STATS_NAMES:
     SSL_CTX_STATS.append((name, getattr(lib, attr)))
 
 class _SSLContext(object):
-    __slots__ = ('ctx', '_check_hostname', 'servername_callback')
+    __slots__ = ('ctx', '_check_hostname', 'servername_callback',
+                 'alpn_protocols', 'npn_protocols')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -1111,6 +1114,28 @@ class _SSLContext(object):
         lib.Cryptography_SSL_CTX_set_tlsext_servername_callback(self.ctx, _servername_callback)
         lib.Cryptography_SSL_CTX_set_tlsext_servername_arg(self.ctx, ffi.new_handle(callback_struct))
 
+    def _set_alpn_protocols(self, protos):
+        if HAS_ALPN:
+            self.alpn_protocols = protocols = ffi.from_buffer(protos)
+            length = len(protocols)
+
+            if lib.SSL_CTX_set_alpn_protos(self.ctx,ffi.cast("unsigned char*", protocols), length):
+                return MemoryError()
+            handle = ffi.new_handle(self)
+            lib.SSL_CTX_set_alpn_select_cb(self.ctx, select_alpn_callback, handle)
+        else:
+            raise NotImplementedError("The ALPN extension requires OpenSSL 1.0.2 or later.")
+
+    def _set_npn_protocols(self, protos):
+        if HAS_NPN:
+            self.npn_protocols = ffi.from_buffer(protos)
+            handle = ffi.new_handle(self)
+            lib.SSL_CTX_set_next_protos_advertised_cb(self.ctx, advertise_npn_callback, handle)
+            lib.SSL_CTX_set_next_proto_select_cb(self.ctx, select_npn_callback, handle)
+        else:
+            raise NotImplementedError("The NPN extension requires OpenSSL 1.0.1 or later.")
+
+
 
 @ffi.callback("void(void)")
 def _servername_callback(ssl, ad, arg):
@@ -1338,3 +1363,50 @@ def get_default_verify_paths():
         return odir
 
     return (ofile_env, ofile, odir_env, odir);
+
+@ffi.callback("int(SSL*,unsigned char **,unsigned char *,const unsigned char *,unsigned int,void *)")
+def select_alpn_callback(ssl, out, outlen, client_protocols, client_protocols_len, args):
+    ctx = ffi.from_handle(args)
+    return do_protocol_selection(1, out, outlen,
+                                 ffi.cast("unsigned char*",ctx.alpn_protocols), len(ctx.alpn_protocols),
+                                 client_protocols, client_protocols_len)
+
+@ffi.callback("int(SSL*,unsigned char **,unsigned char *,const unsigned char *,unsigned int,void *)")
+def select_npn_callback(ssl, out, outlen, server_protocols, server_protocols_len, args):
+    ctx = ffi.from_handle(args)
+    return do_protocol_selection(0, out, outlen, server_protocols, server_protocols_len,
+                                 ffi.cast("unsigned char*",ctx.npn_protocols), len(ctx.npn_protocols))
+
+
+@ffi.callback("int(SSL*,const unsigned char**, unsigned int*, void*)")
+def advertise_npn_callback(ssl, data, length, args):
+    ctx = ffi.from_handle(args)
+
+    if not ctx.npn_protocols:
+        data[0] = ffi.new("unsigned char*", b"")
+        length[0] = 0
+    else:
+        data[0] = ffi.cast("unsigned char*",ctx.npn_protocols)
+        length[0] = len(ctx.npn_protocols)
+
+    return lib.SSL_TLSEXT_ERR_OK
+
+
+if lib.Cryptography_HAS_NPN_NEGOTIATED:
+    def do_protocol_selection(alpn, out, outlen, server_protocols, server_protocols_len,
+                                                 client_protocols, client_protocols_len):
+        if client_protocols == ffi.NULL:
+            client_protocols = b""
+            client_protocols_len = 0
+        if server_protocols == ffi.NULL:
+            server_protocols = ""
+            server_protocols_len = 0
+
+        ret = lib.SSL_select_next_proto(out, outlen,
+                                        server_protocols, server_protocols_len,
+                                        client_protocols, client_protocols_len);
+        if alpn and ret != lib.Cryptography_OPENSSL_NPN_NEGOTIATED:
+            return lib.SSL_TLSEXT_ERR_NOACK
+
+        return lib.SSL_TLSEXT_ERR_OK
+

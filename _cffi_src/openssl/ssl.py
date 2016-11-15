@@ -27,6 +27,8 @@ static const long Cryptography_HAS_SSL_CTX_SET_CLIENT_CERT_ENGINE;
 static const long Cryptography_HAS_SSL_CTX_CLEAR_OPTIONS;
 static const long Cryptography_HAS_NPN_NEGOTIATED;
 
+static const long Cryptography_OPENSSL_NPN_NEGOTIATED;
+
 /* Internally invented symbol to tell us if SNI is supported */
 static const long Cryptography_HAS_TLSEXT_HOSTNAME;
 
@@ -692,8 +694,10 @@ static const long Cryptography_HAS_SSL_CTX_SET_CLIENT_CERT_ENGINE = 1;
 static const long Cryptography_HAS_SSL_CTX_CLEAR_OPTIONS = 1;
 
 #ifdef OPENSSL_NPN_NEGOTIATED
+static const long Cryptography_OPENSSL_NPN_NEGOTIATED = OPENSSL_NPN_NEGOTIATED;
 static const long Cryptography_HAS_NPN_NEGOTIATED = 1;
 #else
+static const long Cryptography_OPENSSL_NPN_NEGOTIATED = 0;
 static const long Cryptography_HAS_NPN_NEGOTIATED = 0;
 #endif
 
