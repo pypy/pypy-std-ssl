@@ -7,8 +7,9 @@ from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.certificate import (_test_decode_cert,
     _decode_certificate, _certificate_to_der)
-from openssl._stdssl.utility import _str_with_len, _bytes_with_len, _str_to_ffi_buffer, _str_from_buf
-from openssl._stdssl.error import (ssl_error, ssl_lib_error, ssl_socket_error,
+from openssl._stdssl.utility import (_str_with_len, _bytes_with_len,
+    _str_to_ffi_buffer, _str_from_buf)
+from openssl._stdssl.error import (ssl_error, pyssl_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
         SSLEOFError)
@@ -61,6 +62,8 @@ OP_ALL = lib.SSL_OP_ALL & ~lib.SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
 SSL_CLIENT = 0
 SSL_SERVER = 1
 
+SSL_CB_MAXLEN=128
+
 if lib.Cryptography_HAS_SSL2:
     PROTOCOL_SSLv2  = 0
 PROTOCOL_SSLv3  = 1
@@ -73,7 +76,7 @@ if lib.Cryptography_HAS_TLSv1_2:
 
 _PROTOCOL_NAMES = (name for name in dir(lib) if name.startswith('PROTOCOL_'))
 
-from enum import Enum as _Enum, IntEnum as _IntEnum
+from enum import IntEnum as _IntEnum
 _IntEnum._convert('_SSLMethod', __name__,
         lambda name: name.startswith('PROTOCOL_'))
 
@@ -312,7 +315,7 @@ class _SSLSocket(object):
             if not (err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE):
                 break
         if ret < 1:
-            raise ssl_lib_error()
+            raise pyssl_error(self, ret)
 
         if self.peer_cert != ffi.NULL:
             lib.X509_free(self.peer_cert)
@@ -399,7 +402,7 @@ class _SSLSocket(object):
         if length > 0:
             return length
         else:
-            raise ssl_socket_error(self, length)
+            raise pyssl_error(self, length)
 
     def read(self, length, buffer_into=None):
         sock = self.get_socket_or_None()
@@ -467,7 +470,7 @@ class _SSLSocket(object):
                 break
 
         if count <= 0 and not shutdown:
-            raise ssl_socket_error(self, err)
+            raise pyssl_error(self, count)
 
         if not buffer_into:
             return _bytes_with_len(dest, count)
@@ -615,7 +618,7 @@ class _SSLSocket(object):
                 break;
 
         if err < 0:
-            raise ssl_socket_error(self, err)
+            raise pyssl_error(self, err)
         if sock:
             return sock
         else:
@@ -626,9 +629,25 @@ class _SSLSocket(object):
         count = lib.SSL_pending(self.ssl)
         # TODO PySSL_END_ALLOW_THREADS
         if count < 0:
-            raise ssl_socket_error(self, count)
+            raise pyssl_error(self, count)
         else:
             return count
+
+    def tls_unique_cb(self):
+        buf = ffi.new("char[%d]" % SSL_CB_MAXLEN)
+
+        if lib.SSL_session_reused(self.ssl) ^ (not self.socket_type):
+            # if session is resumed XOR we are the client
+            length = lib.SSL_get_finished(self.ssl, buf, SSL_CB_MAXLEN)
+        else:
+            # if a new session XOR we are the server
+            length = lib.SSL_get_peer_finished(self.ssl, buf, SSL_CB_MAXLEN)
+
+        # It cannot be negative in current OpenSSL version as of July 2011
+        if length == 0:
+            return None
+
+        return _bytes_with_len(buf, length)
 
 
 def _fs_decode(name):
@@ -710,12 +729,8 @@ class _SSLContext(object):
                 lib.SSL_CTX_set_ecdh_auto(self.ctx, 1)
             else:
                 key = lib.EC_KEY_new_by_curve_name(lib.NID_X9_62_prime256v1)
-                if not key:
-                    raise ssl_lib_error()
-                try:
-                    lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
-                finally:
-                    lib.EC_KEY_free(key)
+                lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
+                lib.EC_KEY_free(key)
         if lib.Cryptography_HAS_X509_V_FLAG_TRUSTED_FIRST:
             store = lib.SSL_CTX_get_cert_store(self.ctx)
             lib.X509_STORE_set_flags(store, lib.X509_V_FLAG_TRUSTED_FIRST)
@@ -846,7 +861,7 @@ class _SSLContext(object):
                     lib.ERR_clear_error()
                     raise OSError(_errno, "Error")
                 else:
-                    raise ssl_lib_error()
+                    raise ssl_error(None)
 
             ffi.errno = 0
             buf = _str_to_ffi_buffer(keyfile)
@@ -861,7 +876,7 @@ class _SSLContext(object):
                     lib.ERR_clear_error()
                     raise OSError(_errno, None)
                 else:
-                    raise ssl_lib_error()
+                    raise ssl_error(None)
 
             ret = lib.SSL_CTX_check_private_key(self.ctx)
             if ret != 1:
@@ -916,7 +931,7 @@ class _SSLContext(object):
                     lib.ERR_clear_error()
                     raise OSError(_errno, '')
                 else:
-                    raise ssl_lib_error()
+                    raise ssl_error(None)
 
     def _add_ca_certs(self, data, size, ca_file_type):
         biobuf = lib.BIO_new_mem_buf(data, size)
@@ -961,7 +976,7 @@ class _SSLContext(object):
                 # EOF PEM file, not an error
                 lib.ERR_clear_error()
             else:
-                raise ssl_lib_error()
+                raise ssl_error(None)
         finally:
             lib.BIO_free(biobuf)
 
@@ -1028,10 +1043,10 @@ class _SSLContext(object):
                 lib.ERR_clear_error()
                 raise OSError(_errno, '')
             else:
-                raise ssl_lib_error()
+                raise ssl_error(None)
         try:
             if lib.SSL_CTX_set_tmp_dh(self.ctx, dh) == 0:
-                raise ssl_lib_error()
+                raise ssl_error(None)
         finally:
             lib.DH_free(dh)
 
@@ -1064,7 +1079,7 @@ class _SSLContext(object):
             raise ValueError("unknown elliptic curve name '%s'" % name)
         key = lib.EC_KEY_new_by_curve_name(nid)
         if not key:
-            raise ssl_lib_error()
+            raise ssl_error(None)
         try:
             lib.SSL_CTX_set_tmp_ecdh(self.ctx, key)
         finally:
@@ -1085,6 +1100,7 @@ class _SSLContext(object):
         SERVERNAME_CALLBACKS[index] = callback_struct
         lib.Cryptography_SSL_CTX_set_tlsext_servername_callback(self.ctx, _servername_callback)
         lib.Cryptography_SSL_CTX_set_tlsext_servername_arg(self.ctx, ffi.new_handle(callback_struct))
+
 
 @ffi.callback("void(void)")
 def _servername_callback(ssl, ad, arg):
@@ -1226,7 +1242,7 @@ class MemoryBIO(object):
             raise ssl_error("cannot write() after write_eof()")
         nbytes = lib.BIO_write(self.bio, buf, len(buf));
         if nbytes < 0:
-            raise ssl_lib_error()
+            raise ssl_error(None)
         return nbytes
 
     def write_eof(self):
@@ -1254,6 +1270,7 @@ class MemoryBIO(object):
     @property
     def pending(self):
         return lib.BIO_ctrl_pending(self.bio)
+
 
 RAND_status = lib.RAND_status
 RAND_add = lib.RAND_add
