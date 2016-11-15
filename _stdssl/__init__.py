@@ -139,7 +139,7 @@ def _ssl_select(sock, writing, timeout):
     if sock is None or timeout == 0:
         return SOCKET_IS_NONBLOCKING
     elif timeout < 0:
-        t = sock.gettimeout() or 0
+        t = sock.gettimeout() or -1
         if t > 0:
             return SOCKET_HAS_TIMED_OUT
         else:
@@ -219,7 +219,7 @@ class _SSLSocket(object):
         # If the socket is in non-blocking mode or timeout mode, set the BIO
         # to non-blocking mode (blocking is the default)
         #
-        timeout = sock.gettimeout() or 0
+        timeout = sock.gettimeout() or -1
         if sock and timeout >= 0:
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), 1)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), 1)
@@ -262,9 +262,8 @@ class _SSLSocket(object):
         ssl = self.ssl
         timeout = 0
         if sock:
-            timeout = sock.gettimeout() or 0
+            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
-            nonblocking = False
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
@@ -280,8 +279,6 @@ class _SSLSocket(object):
             ret = lib.SSL_do_handshake(ssl)
             err = lib.SSL_get_error(ssl, ret)
             # end allow threads
-
-            import pdb; pdb.set_trace()
 
             #if (PyErr_CheckSignals())
             #    goto error;
@@ -340,12 +337,12 @@ class _SSLSocket(object):
         sock = self.get_socket_or_None()
         ssl = self.ssl
         if sock:
-            timeout = sock.gettimeout() or 0
+            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
-        timeout = sock.gettimeout() or 0
+        timeout = sock.gettimeout() or -1
         has_timeout = timeout > 0
         if has_timeout:
             # TODO monotonic clock?
@@ -411,13 +408,13 @@ class _SSLSocket(object):
                     raise OverflowError("maximum length can't fit in a C 'int'")
 
         if sock:
-            timeout = sock.gettimeout() or 0
+            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
         deadline = 0
-        timeout = sock.gettimeout() or 0
+        timeout = sock.gettimeout() or -1
         has_timeout = timeout > 0
         if has_timeout:
             # TODO monotonic clock?
@@ -530,7 +527,7 @@ class _SSLSocket(object):
             if sock.fileno() < 0:
                 raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
 
-            timeout = sock.gettimeout() or 0
+            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
             if sock and timeout >= 0:
                 lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
