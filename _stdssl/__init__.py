@@ -36,7 +36,7 @@ del ver, version_info, status, patch, fix, minor, major
 HAS_ECDH = bool(lib.Cryptography_HAS_ECDH)
 HAS_SNI = bool(lib.Cryptography_HAS_TLSEXT_HOSTNAME)
 HAS_ALPN = bool(lib.Cryptography_HAS_ALPN)
-HAS_NPN = False
+HAS_NPN = lib.Cryptography_HAS_NPN_NEGOTIATED
 HAS_TLS_UNIQUE = True
 
 CLIENT = 0
@@ -477,14 +477,15 @@ class _SSLSocket(object):
 
         return count
 
-    def selected_alpn_protocol(self):
-        out = ffi.new("const unsigned char **")
-        outlen = ffi.new("unsigned int*")
+    if HAS_ALPN:
+        def selected_alpn_protocol(self):
+            out = ffi.new("const unsigned char **")
+            outlen = ffi.new("unsigned int*")
 
-        lib.SSL_get0_alpn_selected(self.ssl, out, outlen);
-        if out == ffi.NULL:
-            return None
-        return _str_with_len(ffi.cast("char*",out[0]), outlen[0]);
+            lib.SSL_get0_alpn_selected(self.ssl, out, outlen);
+            if out == ffi.NULL:
+                return None
+            return _str_with_len(ffi.cast("char*",out[0]), outlen[0]);
 
     def shared_ciphers(self):
         sess = lib.SSL_get_session(self.ssl)
@@ -648,6 +649,15 @@ class _SSLSocket(object):
             return None
 
         return _bytes_with_len(buf, length)
+
+    if HAS_NPN:
+        def selected_npn_protocol(self):
+            out = ffi.new("unsigned char**")
+            outlen = ffi.new("unsigned int*")
+            lib.SSL_get0_next_proto_negotiated(self.ssl, out, outlen)
+            if (out[0] == ffi.NULL):
+                return None
+            return _str_with_len(out[0], outlen[0])
 
 
 def _fs_decode(name):
