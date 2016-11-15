@@ -1,7 +1,7 @@
 from _openssl import ffi
 from _openssl import lib
 
-from openssl._stdssl.utility import _string_from_asn1, _str_to_ffi_buffer
+from openssl._stdssl.utility import _string_from_asn1, _str_to_ffi_buffer, _str_from_buf
 
 SSL_ERROR_NONE = 0
 SSL_ERROR_SSL = 1
@@ -120,15 +120,15 @@ def ssl_socket_error(ss, ret):
     errtype = SSLError
 
     if err == SSL_ERROR_ZERO_RETURN:
-        errtype = ZeroReturnError
+        errtype = SSLZeroReturnError
         errstr = "TLS/SSL connection has been closed"
         errval = SSL_ERROR_ZERO_RETURN
     elif err == SSL_ERROR_WANT_READ:
-        errtype = WantReadError
+        errtype = SSLWantReadError
         errstr = "The operation did not complete (read)"
         errval = SSL_ERROR_WANT_READ
     elif err == SSL_ERROR_WANT_WRITE:
-        errtype = WantWriteError
+        errtype = SSLWantWriteError
         errstr = "The operation did not complete (write)"
         errval = SSL_ERROR_WANT_WRITE
     elif err == SSL_ERROR_WANT_X509_LOOKUP:
@@ -138,24 +138,23 @@ def ssl_socket_error(ss, ret):
         errstr = "The operation did not complete (connect)"
         errval = SSL_ERROR_WANT_CONNECT
     elif err == SSL_ERROR_SYSCALL:
-        xxx
         e = lib.ERR_get_error()
         if e == 0:
-            if ret == 0 or ss.w_socket() is None:
-                w_errtype = get_error(space).w_EOFError
+            if ret == 0 or ss.get_socket_or_None() is None:
+                errtype = EOFError
                 errstr = "EOF occurred in violation of protocol"
-                errval = PY_SSL_ERROR_EOF
+                errval = SSL_ERROR_EOF
             elif ret == -1:
                 # the underlying BIO reported an I/0 error
-                error = rsocket.last_error()
-                return interp_socket.converted_error(space, error)
+                errno = ffi.errno
+                return IOError(errno)
             else:
-                w_errtype = get_error(space).w_SyscallError
+                errtype = SSLSyscallError
                 errstr = "Some I/O error occurred"
-                errval = PY_SSL_ERROR_SYSCALL
+                errval = SSL_ERROR_SYSCALL
         else:
-            errstr = rffi.charp2str(libssl_ERR_error_string(e, None))
-            errval = PY_SSL_ERROR_SYSCALL
+            errstr = _str_from_buf(lib.ERR_error_string(e, ffi.NULL))
+            errval = SSL_ERROR_SYSCALL
     elif err == SSL_ERROR_SSL:
         errval = SSL_ERROR_SSL
         if errcode != 0:

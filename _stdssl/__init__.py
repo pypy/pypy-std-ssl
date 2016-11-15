@@ -7,7 +7,7 @@ from _openssl import ffi
 from _openssl import lib
 from openssl._stdssl.certificate import (_test_decode_cert,
     _decode_certificate, _certificate_to_der)
-from openssl._stdssl.utility import _str_with_len, _bytes_with_len, _str_to_ffi_buffer
+from openssl._stdssl.utility import _str_with_len, _bytes_with_len, _str_to_ffi_buffer, _str_from_buf
 from openssl._stdssl.error import (ssl_error, ssl_lib_error, ssl_socket_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
@@ -88,6 +88,14 @@ lib.SSL_library_init()
 # TODO threads?
 lib.OpenSSL_add_all_algorithms()
 
+def _socket_timeout(s):
+    if s is None:
+        return 0.0
+    t = s.gettimeout()
+    if t is None:
+        return -1.0
+    return t
+
 class PasswordInfo(object):
     callable = None
     password = None
@@ -139,7 +147,7 @@ def _ssl_select(sock, writing, timeout):
     if sock is None or timeout == 0:
         return SOCKET_IS_NONBLOCKING
     elif timeout < 0:
-        t = sock.gettimeout() or -1
+        t = _socket_timeout(sock)
         if t > 0:
             return SOCKET_HAS_TIMED_OUT
         else:
@@ -219,7 +227,7 @@ class _SSLSocket(object):
         # If the socket is in non-blocking mode or timeout mode, set the BIO
         # to non-blocking mode (blocking is the default)
         #
-        timeout = sock.gettimeout() or -1
+        timeout = _socket_timeout(sock)
         if sock and timeout >= 0:
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), 1)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), 1)
@@ -260,9 +268,8 @@ class _SSLSocket(object):
         if sock is None:
             raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
         ssl = self.ssl
-        timeout = 0
+        timeout = _socket_timeout(sock)
         if sock:
-            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
@@ -295,7 +302,7 @@ class _SSLSocket(object):
                 sockstate = SOCKET_OPERATION_OK
 
             if sockstate == SOCKET_HAS_TIMED_OUT:
-                raise SSLError("The handshake operation timed out")
+                raise socket.timeout("The handshake operation timed out")
             elif sockstate == SOCKET_HAS_BEEN_CLOSED:
                 raise SSLError("Underlying socket has been closed.")
             elif sockstate == SOCKET_TOO_LARGE_FOR_SELECT:
@@ -334,15 +341,19 @@ class _SSLSocket(object):
     def write(self, bytestring):
         deadline = 0
         b = _str_to_ffi_buffer(bytestring)
-        sock = self.get_socket_or_None()
+        sock = self.get_socket_or_connection_gone()
         ssl = self.ssl
+
+        if len(b) > sys.maxsize:
+            raise OverflowError("string longer than %d bytes" % sys.maxsize)
+
+        timeout = _socket_timeout(sock)
         if sock:
-            timeout = sock.gettimeout() or -1
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
-        timeout = sock.gettimeout() or -1
+
         has_timeout = timeout > 0
         if has_timeout:
             # TODO monotonic clock?
@@ -350,7 +361,7 @@ class _SSLSocket(object):
 
         sockstate = _ssl_select(sock, 1, timeout)
         if sockstate == SOCKET_HAS_TIMED_OUT:
-            raise socket.TimeoutError("The write operation timed out")
+            raise socket.timeout("The write operation timed out")
         elif sockstate == SOCKET_HAS_BEEN_CLOSED:
             raise ssl_error("Underlying socket has been closed.")
         elif sockstate == SOCKET_TOO_LARGE_FOR_SELECT:
@@ -377,7 +388,7 @@ class _SSLSocket(object):
                 sockstate = SOCKET_OPERATION_OK
 
             if sockstate == SOCKET_HAS_TIMED_OUT:
-                raise socket.TimeoutError("The write operation timed out")
+                raise socket.timeout("The write operation timed out")
             elif sockstate == SOCKET_HAS_BEEN_CLOSED:
                 raise ssl_error("Underlying socket has been closed.")
             elif sockstate == SOCKET_IS_NONBLOCKING:
@@ -388,8 +399,7 @@ class _SSLSocket(object):
         if length > 0:
             return length
         else:
-            raise ssl_lib_error()
-            # return PySSL_SetError(self, len, __FILE__, __LINE__);
+            raise ssl_socket_error(self, length)
 
     def read(self, length, buffer_into=None):
         sock = self.get_socket_or_None()
@@ -412,13 +422,13 @@ class _SSLSocket(object):
                     raise OverflowError("maximum length can't fit in a C 'int'")
 
         if sock:
-            timeout = sock.gettimeout() or -1
+            timeout = _socket_timeout(sock)
             nonblocking = timeout >= 0
             lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
             lib.BIO_set_nbio(lib.SSL_get_wbio(ssl), nonblocking)
 
         deadline = 0
-        timeout = sock.gettimeout() or -1
+        timeout = _socket_timeout(sock)
         has_timeout = timeout > 0
         if has_timeout:
             # TODO monotonic clock?
@@ -450,13 +460,13 @@ class _SSLSocket(object):
                 sockstate = SOCKET_OPERATION_OK
 
             if sockstate == SOCKET_HAS_TIMED_OUT:
-                raise socket.TimeoutError("The read operation timed out")
+                raise socket.timeout("The read operation timed out")
             elif sockstate == SOCKET_IS_NONBLOCKING:
                 break
             if not (err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE):
                 break
 
-        if count <= 0:
+        if count <= 0 and not shutdown:
             raise ssl_socket_error(self, err)
 
         if not buffer_into:
@@ -521,6 +531,11 @@ class _SSLSocket(object):
             return None
         return self.socket()
 
+    def get_socket_or_connection_gone(self):
+        if self.socket is None:
+            raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
+        return self.socket()
+
     def shutdown(self):
         sock = self.get_socket_or_None()
         nonblocking = False
@@ -531,7 +546,7 @@ class _SSLSocket(object):
             if sock.fileno() < 0:
                 raise ssl_error("Underlying socket connection gone", SSL_ERROR_NO_SOCKET)
 
-            timeout = sock.gettimeout() or -1
+            timeout = _socket_timeout(sock)
             nonblocking = timeout >= 0
             if sock and timeout >= 0:
                 lib.BIO_set_nbio(lib.SSL_get_rbio(ssl), nonblocking)
@@ -590,9 +605,9 @@ class _SSLSocket(object):
 
             if sockstate == SOCKET_HAS_TIMED_OUT:
                 if ssl_err == SSL_ERROR_WANT_READ:
-                    raise socket.TimeoutError("The read operation timed out")
+                    raise socket.timeout("The read operation timed out")
                 else:
-                    raise socket.TimeoutError("The write operation timed out")
+                    raise socket.timeout("The write operation timed out")
             elif sockstate == SOCKET_TOO_LARGE_FOR_SELECT:
                 raise ssl_error("Underlying socket too large for select().")
             elif sockstate != SOCKET_OPERATION_OK:
@@ -980,13 +995,6 @@ class _SSLContext(object):
 #        if ctx:
 #            self.ctx = lltype.nullptr(SSL_CTX.TO)
 #            libssl_SSL_CTX_free(ctx)
-#
-#    @staticmethod
-#    @unwrap_spec(protocol=int)
-#    def descr_new(space, w_subtype, protocol=PY_SSL_VERSION_SSL23):
-#        self = space.allocate_instance(SSLContext, w_subtype)
-#        self.__init__(space, protocol)
-#        return space.wrap(self)
 
     def session_stats(self):
         stats = {}
@@ -998,34 +1006,6 @@ class _SSLContext(object):
         if not lib.SSL_CTX_set_default_verify_paths(self.ctx):
             raise ssl_error("")
 
-#    def descr_get_options(self, space):
-#        return space.newlong(libssl_SSL_CTX_get_options(self.ctx))
-#
-#    def descr_set_options(self, space, w_new_opts):
-#        new_opts = space.int_w(w_new_opts)
-#        opts = libssl_SSL_CTX_get_options(self.ctx)
-#        clear = opts & ~new_opts
-#        set = ~opts & new_opts
-#        if clear:
-#            if HAVE_SSL_CTX_CLEAR_OPTIONS:
-#                libssl_SSL_CTX_clear_options(self.ctx, clear)
-#            else:
-#                raise oefmt(space.w_ValueError,
-#                            "can't clear options before OpenSSL 0.9.8m")
-#        if set:
-#            libssl_SSL_CTX_set_options(self.ctx, set)
-#
-#    def descr_get_check_hostname(self, space):
-#        return space.newbool(self.check_hostname)
-#
-#    def descr_set_check_hostname(self, space, w_obj):
-#        check_hostname = space.is_true(w_obj)
-#        if check_hostname and libssl_SSL_CTX_get_verify_mode(self.ctx) == SSL_VERIFY_NONE:
-#            raise oefmt(space.w_ValueError,
-#                        "check_hostname needs a SSL context with either "
-#                        "CERT_OPTIONAL or CERT_REQUIRED")
-#        self.check_hostname = check_hostname
-#
     def load_dh_params(self, filepath):
         ffi.errno = 0
         if filepath is None:
@@ -1055,50 +1035,6 @@ class _SSLContext(object):
         finally:
             lib.DH_free(dh)
 
-#    def cert_store_stats_w(self, space):
-#        store = libssl_SSL_CTX_get_cert_store(self.ctx)
-#        x509 = 0
-#        x509_ca = 0
-#        crl = 0
-#        for i in range(libssl_sk_X509_OBJECT_num(store[0].c_objs)):
-#            obj = libssl_sk_X509_OBJECT_value(store[0].c_objs, i)
-#            if intmask(obj.c_type) == X509_LU_X509:
-#                x509 += 1
-#                if libssl_X509_check_ca(
-#                        libssl_pypy_X509_OBJECT_data_x509(obj)):
-#                    x509_ca += 1
-#            elif intmask(obj.c_type) == X509_LU_CRL:
-#                crl += 1
-#            else:
-#                # Ignore X509_LU_FAIL, X509_LU_RETRY, X509_LU_PKEY.
-#                # As far as I can tell they are internal states and never
-#                # stored in a cert store
-#                pass
-#        w_result = space.newdict()
-#        space.setitem(w_result,
-#                      space.wrap('x509'), space.wrap(x509))
-#        space.setitem(w_result,
-#                      space.wrap('x509_ca'), space.wrap(x509_ca))
-#        space.setitem(w_result,
-#                      space.wrap('crl'), space.wrap(crl))
-#        return w_result
-#
-#    @unwrap_spec(protos='bufferstr')
-#    def set_npn_protocols_w(self, space, protos):
-#        if not HAS_NPN:
-#            raise oefmt(space.w_NotImplementedError,
-#                        "The NPN extension requires OpenSSL 1.0.1 or later.")
-#
-#        self.npn_protocols = SSLNpnProtocols(self.ctx, protos)
-#
-#    @unwrap_spec(protos='bufferstr')
-#    def set_alpn_protocols_w(self, space, protos):
-#        if not HAS_ALPN:
-#            raise oefmt(space.w_NotImplementedError,
-#                        "The ALPN extension requires OpenSSL 1.0.2 or later.")
-#
-#        self.alpn_protocols = SSLAlpnProtocols(self.ctx, protos)
-#
     def get_ca_certs(self, binary_form=None):
         binary_mode = bool(binary_form)
         _list = []
@@ -1219,9 +1155,6 @@ def _servername_callback(ssl, ad, arg):
 class ServernameCallback(object):
     ctx = None
 SERVERNAME_CALLBACKS = weakref.WeakValueDictionary()
-
-def _str_from_buf(buf):
-    return ffi.string(buf).decode('utf-8')
 
 def _asn1obj2py(obj):
     nid = lib.OBJ_obj2nid(obj)
@@ -1359,7 +1292,7 @@ def _cstr_decode_fs(buf):
 #            target = PyBytes_FromString(tmp); } \
 #        if (!target) goto error; \
 #    }
-    # XXX
+    # REVIEW
     return ffi.string(buf).decode(sys.getfilesystemencoding())
 
 def get_default_verify_paths():
