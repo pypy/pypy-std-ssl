@@ -602,6 +602,15 @@ class _SSLSocket(object):
         else:
             return None
 
+    def pending(self):
+        # TODO PySSL_BEGIN_ALLOW_THREADS
+        count = lib.SSL_pending(self.ssl)
+        # TODO PySSL_END_ALLOW_THREADS
+        if count < 0:
+            raise ssl_socket_error(self, count)
+        else:
+            return count
+
 
 def _fs_decode(name):
     # TODO return PyUnicode_DecodeFSDefault(short_name);
