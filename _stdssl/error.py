@@ -1,3 +1,5 @@
+import sys
+import traceback
 from _openssl import ffi
 from _openssl import lib
 
@@ -148,3 +150,49 @@ def fill_sslerror(errtype, ssl_errno, errstr, errcode):
     err_value.library = lib_str if lib_str else None
     return err_value
 
+def pyerr_write_unraisable(exc, obj):
+    f = sys.stderr
+
+    if obj:
+        f.write("Exception ignored in: ")
+        f.write(repr(obj))
+        f.write("\n")
+
+    t, v, tb = sys.exc_info()
+    traceback.print_tb(tb, file=f)
+
+    assert isinstance(v, Exception)
+    f.write(t.__module__ + "." + t.__name__)
+    f.write(": ")
+    f.write(str(v))
+    f.write("\n")
+
+SSL_AD_NAMES = [
+    "ACCESS_DENIED",
+    "BAD_CERTIFICATE",
+    "BAD_CERTIFICATE_HASH_VALUE",
+    "BAD_CERTIFICATE_STATUS_RESPONSE",
+    "BAD_RECORD_MAC",
+    "CERTIFICATE_EXPIRED",
+    "CERTIFICATE_REVOKED",
+    "CERTIFICATE_UNKNOWN",
+    "CERTIFICATE_UNOBTAINABLE",
+    "CLOSE_NOTIFY",
+    "DECODE_ERROR",
+    "DECOMPRESSION_FAILURE",
+    "DECRYPT_ERROR",
+    "HANDSHAKE_FAILURE",
+    "ILLEGAL_PARAMETER",
+    "INSUFFICIENT_SECURITY",
+    "INTERNAL_ERROR",
+    "NO_RENEGOTIATION",
+    "PROTOCOL_VERSION",
+    "RECORD_OVERFLOW",
+    "UNEXPECTED_MESSAGE",
+    "UNKNOWN_CA",
+    "UNKNOWN_PSK_IDENTITY",
+    "UNRECOGNIZED_NAME",
+    "UNSUPPORTED_CERTIFICATE",
+    "UNSUPPORTED_EXTENSION",
+    "USER_CANCELLED",
+]

@@ -17,7 +17,9 @@ from openssl._stdssl.error import (SSL_ERROR_NONE,
         SSL_ERROR_SSL, SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE,
         SSL_ERROR_WANT_X509_LOOKUP, SSL_ERROR_SYSCALL,
         SSL_ERROR_ZERO_RETURN, SSL_ERROR_WANT_CONNECT,
-        SSL_ERROR_EOF, SSL_ERROR_NO_SOCKET, SSL_ERROR_INVALID_ERROR_CODE)
+        SSL_ERROR_EOF, SSL_ERROR_NO_SOCKET, SSL_ERROR_INVALID_ERROR_CODE,
+        pyerr_write_unraisable)
+from openssl._stdssl import error
 
 
 OPENSSL_VERSION = ffi.string(lib.OPENSSL_VERSION_TEXT).decode('utf-8')
@@ -84,6 +86,12 @@ if HAS_TLS_UNIQUE:
     CHANNEL_BINDING_TYPES = ['tls-unique']
 else:
     CHANNEL_BINDING_TYPES = []
+
+for name in error.SSL_AD_NAMES:
+    lib_attr = 'SSL_AD_' + name
+    attr = 'ALERT_DESCRIPTION_' + name
+    if hasattr(lib, lib_attr):
+        globals()[attr] = getattr(lib, lib_attr)
 
 # init open ssl
 lib.SSL_load_error_strings()
@@ -205,7 +213,8 @@ class _SSLSocket(object):
         lib.ERR_clear_error()
         self.ssl = ssl = lib.SSL_new(ctx)
 
-        lib.SSL_set_app_data(ssl, b"")
+        self._app_data_handle = ffi.new_handle(self) # TODO release later
+        lib.SSL_set_app_data(ssl, ffi.cast("char*", self._app_data_handle))
         if sock:
             lib.SSL_set_fd(ssl, sock.fileno())
         else:
@@ -254,11 +263,23 @@ class _SSLSocket(object):
         self.ssl = ffi.NULL
         self.shutdown_seen_zero = 0
         self.handshake_done = 0
-        self.owner = None
+        self._owner = None
         self.server_hostname = None
         self.socket = None
         self.alpn_protocols = ffi.NULL
         self.npn_protocols = ffi.NULL
+
+    @property
+    def owner(self):
+        if self._owner is None:
+            return None
+        return self._owner()
+
+    @owner.setter
+    def owner(self, value):
+        if value is None:
+            self._owner = None
+        self._owner = weakref.ref(value)
 
     @property
     def context(self):
@@ -696,7 +717,8 @@ for name in SSL_CTX_STATS_NAMES:
 
 class _SSLContext(object):
     __slots__ = ('ctx', '_check_hostname', 'servername_callback',
-                 'alpn_protocols', 'npn_protocols')
+                 'alpn_protocols', 'npn_protocols', 'set_hostname',
+                 '_set_hostname_handle')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -858,8 +880,9 @@ class _SSLContext(object):
                 else:
                     raise TypeError("password should be a string or callable")
 
+            handle = ffi.new_handle(pw_info) # XXX MUST NOT be garbage collected
             lib.SSL_CTX_set_default_passwd_cb(self.ctx, Cryptography_pem_password_cb)
-            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, ffi.new_handle(pw_info))
+            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, handle)
 
         try:
             ffi.errno = 0
@@ -1099,20 +1122,21 @@ class _SSLContext(object):
             lib.EC_KEY_free(key)
 
     def set_servername_callback(self, callback):
+        if not HAS_SNI or lib.Cryptography_NO_TLSEXT:
+            raise NotImplementedError("The TLS extension servername callback, "
+                    "SSL_CTX_set_tlsext_servername_callback, "
+                    "is not in the current OpenSSL library.")
         if callback is None:
             lib.SSL_CTX_set_tlsext_servername_callback(self.ctx, ffi.NULL)
-            self.servername_callback = None
+            self.set_hostname = None
+            self._set_hostname_handle = None
             return
         if not callable(callback):
             raise TypeError("not a callable object")
-        callback_struct = ServernameCallback()
-        callback_struct.ctx = self
-        callback_struct.set_hostname = callback
-        self.servername_callback = callback_struct
-        index = id(self)
-        SERVERNAME_CALLBACKS[index] = callback_struct
+        scb = ServernameCallback(callback, self)
+        self._set_hostname_handle = ffi.new_handle(scb)
         lib.Cryptography_SSL_CTX_set_tlsext_servername_callback(self.ctx, _servername_callback)
-        lib.Cryptography_SSL_CTX_set_tlsext_servername_arg(self.ctx, ffi.new_handle(callback_struct))
+        lib.Cryptography_SSL_CTX_set_tlsext_servername_arg(self.ctx, self._set_hostname_handle)
 
     def _set_alpn_protocols(self, protos):
         if HAS_ALPN:
@@ -1137,75 +1161,96 @@ class _SSLContext(object):
 
 
 
-@ffi.callback("void(void)")
-def _servername_callback(ssl, ad, arg):
-    struct = ffi.from_handle(arg)
-    w_ctx = struct.w_ctx
-    space = struct.space
-    w_callback = struct.w_set_hostname
-    if not w_ctx.servername_callback:
-        # Possible race condition.
-        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_OK)
-    # The high-level ssl.SSLSocket object
-    index = rffi.cast(lltype.Signed, libssl_SSL_get_app_data(ssl))
-    w_ssl = SOCKET_STORAGE.get(index)
-    assert isinstance(w_ssl, SSLSocket)
-    # The servername callback expects an argument that represents the current
-    # SSL connection and that has a .context attribute that can be changed to
-    # identify the requested hostname. Since the official API is the Python
-    # level API we want to pass the callback a Python level object rather than
-    # a _ssl.SSLSocket instance. If there's an "owner" (typically an
-    # SSLObject) that will be passed. Otherwise if there's a socket then that
-    # will be passed. If both do not exist only then the C-level object is
-    # passed.
-    if w_ssl.w_owner is not None:
-        w_ssl_socket = w_ssl.w_owner()
-    elif w_ssl.w_socket is not None:
-        w_ssl_socket = w_ssl.w_socket()
-    else:
-        w_ssl_socket = w_ssl
-    if space.is_none(w_ssl_socket):
-        ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
-        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+if HAS_SNI and not lib.Cryptography_NO_TLSEXT:
+    @ffi.callback("int(SSL*,int*,void*)")
+    def _servername_callback(s, al, arg):
+        scb = ffi.from_handle(arg)
+        ssl_ctx = scb.ctx
+        servername = lib.SSL_get_servername(s, lib.TLSEXT_NAMETYPE_host_name)
+        set_hostname = scb.callback
+        #ifdef WITH_THREAD
+            # TODO PyGILState_STATE gstate = PyGILState_Ensure();
+        #endif
 
-    servername = libssl_SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
-    try:
-        if not servername:
-            w_result = space.call_function(w_callback,
-                                           w_ssl_socket, space.w_None, w_ctx)
+        if set_hostname is None:
+            #/* remove race condition in this the call back while if removing the
+            # * callback is in progress */
+            #ifdef WITH_THREAD
+                    # TODO PyGILState_Release(gstate);
+            #endif
+            return lib.SSL_TLSEXT_ERR_OK
 
-        else:
-            w_servername = space.newbytes(rffi.charp2str(servername))
+        ssl = ffi.from_handle(lib.SSL_get_app_data(s))
+        assert isinstance(ssl, _SSLSocket)
+
+        # The servername callback expects an argument that represents the current
+        # SSL connection and that has a .context attribute that can be changed to
+        # identify the requested hostname. Since the official API is the Python
+        # level API we want to pass the callback a Python level object rather than
+        # a _ssl.SSLSocket instance. If there's an "owner" (typically an
+        # SSLObject) that will be passed. Otherwise if there's a socket then that
+        # will be passed. If both do not exist only then the C-level object is
+        # passed.
+        ssl_socket = ssl.owner
+        if not ssl_socket:
+            ssl_socket = ssl.get_socket_or_None()
+
+        if ssl_socket is None:
+            al[0] = lib.SSL_AD_INTERNAL_ERROR
+            return lib.SSL_TLSEXT_ERR_ALERT_FATAL
+
+        if servername == ffi.NULL:
             try:
-                w_servername_idna = space.call_method(
-                    w_servername, 'decode', space.wrap('idna'))
-            except OperationError as e:
-                e.write_unraisable(space, "undecodable server name")
-                ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
-                return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+                result = set_hostname(ssl_socket, None, ssl_ctx)
+            except Exception as e:
+                pyerr_write_unraisable(e, set_hostname)
+                al[0] = lib.SSL_AD_HANDSHAKE_FAILURE
+                return lib.SSL_TLSEXT_ERR_ALERT_FATAL
+        else:
+            servername = ffi.string(servername)
 
-            w_result = space.call_function(w_callback,
-                                           w_ssl_socket,
-                                           w_servername_idna, w_ctx)
-    except OperationError as e:
-        e.write_unraisable(space, "in servername callback")
-        ad[0] = rffi.cast(rffi.INT, SSL_AD_HANDSHAKE_FAILURE)
-        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+            try:
+                servername_idna = servername.decode("idna")
+            except UnicodeDecodeError as e:
+                pyerr_write_unraisable(e, servername)
 
-    if space.is_none(w_result):
-        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_OK)
-    else:
-        try:
-            ad[0] = rffi.cast(rffi.INT, space.int_w(w_result))
-        except OperationError as e:
-            e.write_unraisable(space, "servername callback result")
-            ad[0] = rffi.cast(rffi.INT, SSL_AD_INTERNAL_ERROR)
-        return rffi.cast(rffi.INT, SSL_TLSEXT_ERR_ALERT_FATAL)
+            try:
+                result = set_hostname(ssl_socket, servername_idna, ssl_ctx)
+            except Exception as e:
+                pyerr_write_unraisable(e, set_hostname)
+                al[0] = lib.SSL_AD_HANDSHAKE_FAILURE
+                return lib.SSL_TLSEXT_ERR_ALERT_FATAL
 
+        if result is not None:
+            # this is just a poor man's emulation:
+            # in CPython this works a bit different, it calls all the way
+            # down from PyLong_AsLong to _PyLong_FromNbInt which raises
+            # a TypeError if there is no nb_int slot filled.
+            try:
+                if isinstance(result, int):
+                    al[0] = result
+                else:
+                    if result is not None:
+                        if hasattr(result,'__int__'):
+                            al[0] = result.__int__()
+                            return lib.SSL_TLSEXT_ERR_ALERT_FATAL
+                    # needed because sys.exec_info is used in pyerr_write_unraisable
+                    raise TypeError("an integer is required (got type %s)" % result)
+            except TypeError as e:
+                pyerr_write_unraisable(e, result)
+                al[0] = lib.SSL_AD_INTERNAL_ERROR
+            return lib.SSL_TLSEXT_ERR_ALERT_FATAL
+        else:
+            # TODO gil state release?
+            return lib.SSL_TLSEXT_ERR_OK
 
 class ServernameCallback(object):
-    ctx = None
+    def __init__(self, callback, ctx):
+        self.callback = callback
+        self.ctx = ctx
+
 SERVERNAME_CALLBACKS = weakref.WeakValueDictionary()
+TEST = None
 
 def _asn1obj2py(obj):
     nid = lib.OBJ_obj2nid(obj)
@@ -1216,7 +1261,7 @@ def _asn1obj2py(obj):
     buf = ffi.new("char[255]")
     length = lib.OBJ_obj2txt(buf, len(buf), obj, 1)
     if length < 0:
-        _setSSLError("todo")
+        ssl_error(None)
     if length > 0:
         return (nid, sn, ln, _str_with_len(buf, length))
     else:
