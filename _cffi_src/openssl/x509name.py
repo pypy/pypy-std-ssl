@@ -35,7 +35,7 @@ void X509_NAME_ENTRY_free(X509_NAME_ENTRY *);
 int X509_NAME_get_index_by_NID(X509_NAME *, int, int);
 int X509_NAME_cmp(const X509_NAME *, const X509_NAME *);
 X509_NAME *X509_NAME_dup(X509_NAME *);
-int Cryptography_X509_NAME_ENTRY_set(const X509_NAME_ENTRY * ne);
+int Cryptography_X509_NAME_ENTRY_set(X509_NAME_ENTRY *);
 """
 
 MACROS = """
