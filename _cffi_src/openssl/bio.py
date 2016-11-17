@@ -11,6 +11,7 @@ INCLUDES = """
 TYPES = """
 typedef struct bio_st BIO;
 typedef void bio_info_cb(BIO *, int, const char *, int, long, long);
+typedef ... bio_st;
 typedef ... BIO_METHOD;
 typedef ... BUF_MEM;
 

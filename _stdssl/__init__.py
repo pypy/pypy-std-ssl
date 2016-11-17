@@ -292,7 +292,14 @@ class _SSLSocket(object):
 
     @context.setter
     def context(self, value):
-        self.ctx = value
+        if isinstance(value, _SSLContext):
+            if not HAS_SNI:
+                raise NotImplementedError("setting a socket's "
+                        "context is not supported by your OpenSSL library")
+            self.ctx = value
+            lib.SSL_set_SSL_CTX(self.ssl, self.ctx.ctx);
+        else:
+            raise TypeError("The value must be a SSLContext")
 
     def do_handshake(self):
         sock = self.get_socket_or_connection_gone()
@@ -1137,7 +1144,7 @@ class _SSLContext(object):
                     "is not in the current OpenSSL library.")
         if callback is None:
             lib.SSL_CTX_set_tlsext_servername_callback(self.ctx, ffi.NULL)
-            self._set_hostname_handle = ffi.new_handle(scb)
+            self._set_hostname_handle = None
             return
         if not callable(callback):
             raise TypeError("not a callable object")
