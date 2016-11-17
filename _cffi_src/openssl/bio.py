@@ -11,7 +11,6 @@ INCLUDES = """
 TYPES = """
 typedef struct bio_st BIO;
 typedef void bio_info_cb(BIO *, int, const char *, int, long, long);
-typedef ... bio_st;
 typedef ... BIO_METHOD;
 typedef ... BUF_MEM;
 
@@ -82,6 +81,8 @@ int BIO_gets(BIO *, char *, int);
 int BIO_write(BIO *, const void *, int);
 int BIO_puts(BIO *, const char *);
 int BIO_method_type(const BIO *);
+
+int * Cryptography_bio_references(const BIO *);
 """
 
 MACROS = """
@@ -132,7 +133,12 @@ long BIO_set_buffer_read_data(BIO *, void *, long);
 long BIO_set_nbio(BIO *, long);
 void BIO_set_retry_read(BIO *);
 void BIO_clear_retry_flags(BIO *);
+
+#define CRYPTO_LOCK_BIO ...
 """
 
 CUSTOMIZATIONS = """
+int * Cryptography_bio_references(const BIO * b) {
+    return &b->references;
+}
 """
