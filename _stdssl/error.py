@@ -48,7 +48,7 @@ def ssl_error(errstr, errcode=0):
     if errstr is None:
         errcode = lib.ERR_peek_last_error()
     try:
-        return fill_sslerror(SSLError, errcode, errstr, 0)
+        return fill_sslerror(SSLError, errcode, errstr, errcode)
     finally:
         lib.ERR_clear_error()
 
@@ -101,14 +101,18 @@ def pyssl_error(obj, ret):
             errval = SSL_ERROR_WANT_CONNECT
         elif err == SSL_ERROR_SYSCALL:
             if e == 0:
-                if ret == 0 or obj.get_socket_or_None() is None:
-                    errtype = EOFError
+                s = obj.get_socket_or_None()
+                if ret == 0 or s is None:
+                    errtype = SSLEOFError
                     errstr = "EOF occurred in violation of protocol"
                     errval = SSL_ERROR_EOF
-                elif ret == -1:
+                elif ret == -1 and s:
                     # the underlying BIO reported an I/0 error
-                    errno = ffi.errno
-                    return IOError(errno)
+                    lib.ERR_clear_error()
+                    s.errorhandler()
+                    assert 0, "must not get here"
+                    #errno = ffi.errno
+                    #return IOError(errno)
                 else:
                     errtype = SSLSyscallError
                     errstr = "Some I/O error occurred"

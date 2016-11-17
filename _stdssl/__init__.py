@@ -98,6 +98,10 @@ lib.SSL_library_init()
 # TODO threads?
 lib.OpenSSL_add_all_algorithms()
 
+def check_signals():
+    # TODO PyErr_CheckSignal equivalent for pypy?
+    pass
+
 def _socket_timeout(s):
     if s is None:
         return 0.0
@@ -313,8 +317,7 @@ class _SSLSocket(object):
             err = lib.SSL_get_error(ssl, ret)
             # end allow threads
 
-            #if (PyErr_CheckSignals())
-            #    goto error;
+            check_signals()
 
             if has_timeout:
                 # REIVIEW monotonic clock?
@@ -399,8 +402,7 @@ class _SSLSocket(object):
             err = lib.SSL_get_error(self.ssl, length)
             #PySSL_END_ALLOW_THREADS
 
-            # TODO if (PyErr_CheckSignals())
-            # TODO     goto error;
+            check_signals()
 
             if has_timeout:
                 # TODO monotonic clock
@@ -467,9 +469,7 @@ class _SSLSocket(object):
             err = lib.SSL_get_error(self.ssl, count);
             #PySSL_END_ALLOW_THREADS
 
-            # TODO
-            #if (PyErr_CheckSignals())
-            #    goto error;
+            check_signals()
 
             if has_timeout:
                 timeout = deadline - time.time() # TODO ? _PyTime_GetMonotonicClock();
@@ -1312,8 +1312,11 @@ class MemoryBIO(object):
 
     def write(self, strlike):
         INT_MAX = 2**31-1
-        _bytes = _str_to_ffi_buffer(strlike)
-        buf = ffi.from_buffer(_bytes)
+        if isinstance(strlike, memoryview):
+            # FIXME pypy must support get_raw_address for
+            # StringBuffer to remove this case!
+            strlike = strlike.tobytes()
+        buf = ffi.from_buffer(strlike)
         if len(buf) > INT_MAX:
             raise OverflowError("string longer than %d bytes", INT_MAX)
 

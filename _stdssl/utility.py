@@ -1,3 +1,4 @@
+import sys
 from _openssl import ffi
 from _openssl import lib
 
