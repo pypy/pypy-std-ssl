@@ -8,7 +8,7 @@ from _openssl import lib
 from openssl._stdssl.certificate import (_test_decode_cert,
     _decode_certificate, _certificate_to_der)
 from openssl._stdssl.utility import (_str_with_len, _bytes_with_len,
-    _str_to_ffi_buffer, _str_from_buf)
+    _str_to_ffi_buffer, _str_from_buf, _cstr_decode_fs)
 from openssl._stdssl.error import (ssl_error, pyssl_error,
         SSLError, SSLZeroReturnError, SSLWantReadError,
         SSLWantWriteError, SSLSyscallError,
@@ -20,7 +20,6 @@ from openssl._stdssl.error import (SSL_ERROR_NONE,
         SSL_ERROR_EOF, SSL_ERROR_NO_SOCKET, SSL_ERROR_INVALID_ERROR_CODE,
         pyerr_write_unraisable)
 from openssl._stdssl import error
-
 
 OPENSSL_VERSION = ffi.string(lib.OPENSSL_VERSION_TEXT).decode('utf-8')
 OPENSSL_VERSION_NUMBER = lib.OPENSSL_VERSION_NUMBER
@@ -111,6 +110,7 @@ class PasswordInfo(object):
     callable = None
     password = None
     operationerror = None
+    handle = None
 PWINFO_STORAGE = {}
 
 def _Cryptography_pem_password_cb(buf, size, rwflag, userdata):
@@ -266,8 +266,8 @@ class _SSLSocket(object):
         self._owner = None
         self.server_hostname = None
         self.socket = None
-        self.alpn_protocols = ffi.NULL
-        self.npn_protocols = ffi.NULL
+        #self.alpn_protocols = ffi.NULL
+        #self.npn_protocols = ffi.NULL
 
     @property
     def owner(self):
@@ -718,7 +718,7 @@ for name in SSL_CTX_STATS_NAMES:
 class _SSLContext(object):
     __slots__ = ('ctx', '_check_hostname', 'servername_callback',
                  'alpn_protocols', 'npn_protocols', 'set_hostname',
-                 '_set_hostname_handle')
+                 '_set_hostname_handle', '_npn_protocols_handle')
 
     def __new__(cls, protocol):
         self = object.__new__(cls)
@@ -869,8 +869,6 @@ class _SSLContext(object):
         pw_info = PasswordInfo()
         index = -1
         if password is not None:
-            index = _thread.get_ident()
-            PWINFO_STORAGE[index] = pw_info
 
             if callable(password):
                 pw_info.callable = password
@@ -880,9 +878,11 @@ class _SSLContext(object):
                 else:
                     raise TypeError("password should be a string or callable")
 
-            handle = ffi.new_handle(pw_info) # XXX MUST NOT be garbage collected
+            pw_info.handle = ffi.new_handle(pw_info)
+            index = _thread.get_ident()
+            PWINFO_STORAGE[index] = pw_info
             lib.SSL_CTX_set_default_passwd_cb(self.ctx, Cryptography_pem_password_cb)
-            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, handle)
+            lib.SSL_CTX_set_default_passwd_cb_userdata(self.ctx, pw_info.handle)
 
         try:
             ffi.errno = 0
@@ -916,7 +916,7 @@ class _SSLContext(object):
 
             ret = lib.SSL_CTX_check_private_key(self.ctx)
             if ret != 1:
-                raise _ssl_seterror(None, -1)
+                raise ssl_error(None)
         finally:
             if index >= 0:
                 del PWINFO_STORAGE[index]
@@ -1041,6 +1041,7 @@ class _SSLContext(object):
         return {'x509': x509, 'x509_ca': x509_ca, 'crl': crl}
 
 
+#    REVIEW, how to do that properly
 #    def _finalize_(self):
 #        ctx = self.ctx
 #        if ctx:
@@ -1154,6 +1155,7 @@ class _SSLContext(object):
         if HAS_NPN:
             self.npn_protocols = ffi.from_buffer(protos)
             handle = ffi.new_handle(self)
+            self._npn_protocols_handle = handle # track a reference to the handle
             lib.SSL_CTX_set_next_protos_advertised_cb(self.ctx, advertise_npn_callback, handle)
             lib.SSL_CTX_set_next_proto_select_cb(self.ctx, select_npn_callback, handle)
         else:
@@ -1308,12 +1310,9 @@ class MemoryBIO(object):
         """Whether the memory BIO is at EOF."""
         return lib.BIO_ctrl_pending(self.bio) == 0 and self.eof_written
 
-    def write(self, _bytes):
+    def write(self, strlike):
         INT_MAX = 2**31-1
-        if isinstance(_bytes, memoryview):
-            # REVIEW pypy does not support from_buffer of a memoryview
-            # copies the data!
-            _bytes = bytes(_bytes)
+        _bytes = _str_to_ffi_buffer(strlike)
         buf = ffi.from_buffer(_bytes)
         if len(buf) > INT_MAX:
             raise OverflowError("string longer than %d bytes", INT_MAX)
@@ -1367,7 +1366,7 @@ def _RAND_bytes(count, pseudo):
         ok = lib.RAND_bytes(buf, count)
         if ok == 1:
             return ffi.string(buf)
-    raise ssl_error("", errcode=lib.ERR_get_error())
+    raise ssl_error(None, errcode=lib.ERR_get_error())
 
 def RAND_pseudo_bytes(count):
     return _RAND_bytes(count, True)
@@ -1378,19 +1377,6 @@ def RAND_bytes(count):
 def RAND_add(view, entropy):
     buf = _str_to_ffi_buffer(view)
     lib.RAND_add(buf, len(buf), entropy)
-
-
-def _cstr_decode_fs(buf):
-#define CONVERT(info, target) { \
-#        const char *tmp = (info); \
-#        target = NULL; \
-#        if (!tmp) { Py_INCREF(Py_None); target = Py_None; } \
-#        else if ((target = PyUnicode_DecodeFSDefault(tmp)) == NULL) { \
-#            target = PyBytes_FromString(tmp); } \
-#        if (!target) goto error; \
-#    }
-    # REVIEW
-    return ffi.string(buf).decode(sys.getfilesystemencoding())
 
 def get_default_verify_paths():
 
@@ -1406,7 +1392,6 @@ def get_default_verify_paths():
     odir = _cstr_decode_fs(lib.X509_get_default_cert_dir())
     if odir is None:
         return odir
-
     return (ofile_env, ofile, odir_env, odir);
 
 @ffi.callback("int(SSL*,unsigned char **,unsigned char *,const unsigned char *,unsigned int,void *)")
@@ -1416,28 +1401,28 @@ def select_alpn_callback(ssl, out, outlen, client_protocols, client_protocols_le
                                  ffi.cast("unsigned char*",ctx.alpn_protocols), len(ctx.alpn_protocols),
                                  client_protocols, client_protocols_len)
 
-@ffi.callback("int(SSL*,unsigned char **,unsigned char *,const unsigned char *,unsigned int,void *)")
-def select_npn_callback(ssl, out, outlen, server_protocols, server_protocols_len, args):
-    ctx = ffi.from_handle(args)
-    return do_protocol_selection(0, out, outlen, server_protocols, server_protocols_len,
-                                 ffi.cast("unsigned char*",ctx.npn_protocols), len(ctx.npn_protocols))
-
-
-@ffi.callback("int(SSL*,const unsigned char**, unsigned int*, void*)")
-def advertise_npn_callback(ssl, data, length, args):
-    ctx = ffi.from_handle(args)
-
-    if not ctx.npn_protocols:
-        data[0] = ffi.new("unsigned char*", b"")
-        length[0] = 0
-    else:
-        data[0] = ffi.cast("unsigned char*",ctx.npn_protocols)
-        length[0] = len(ctx.npn_protocols)
-
-    return lib.SSL_TLSEXT_ERR_OK
-
-
 if lib.Cryptography_HAS_NPN_NEGOTIATED:
+    @ffi.callback("int(SSL*,unsigned char **,unsigned char *,const unsigned char *,unsigned int,void *)")
+    def select_npn_callback(ssl, out, outlen, server_protocols, server_protocols_len, args):
+        ctx = ffi.from_handle(args)
+        return do_protocol_selection(0, out, outlen, server_protocols, server_protocols_len,
+                                     ffi.cast("unsigned char*",ctx.npn_protocols), len(ctx.npn_protocols))
+
+
+    @ffi.callback("int(SSL*,const unsigned char**, unsigned int*, void*)")
+    def advertise_npn_callback(ssl, data, length, args):
+        ctx = ffi.from_handle(args)
+
+        if not ctx.npn_protocols:
+            data[0] = ffi.new("unsigned char*", b"")
+            length[0] = 0
+        else:
+            data[0] = ffi.cast("unsigned char*",ctx.npn_protocols)
+            length[0] = len(ctx.npn_protocols)
+
+        return lib.SSL_TLSEXT_ERR_OK
+
+
     def do_protocol_selection(alpn, out, outlen, server_protocols, server_protocols_len,
                                                  client_protocols, client_protocols_len):
         if client_protocols == ffi.NULL:

@@ -48,7 +48,7 @@ def ssl_error(errstr, errcode=0):
     if errstr is None:
         errcode = lib.ERR_peek_last_error()
     try:
-        return fill_sslerror(SSLError, errcode, errstr)
+        return fill_sslerror(SSLError, errcode, errstr, 0)
     finally:
         lib.ERR_clear_error()
 
@@ -138,6 +138,7 @@ def fill_sslerror(errtype, ssl_errno, errstr, errcode):
         lib_str = LIB_CODES_TO_NAMES.get(err_lib, None)
         if errstr is None:
             errstr = _str_from_buf(lib.ERR_reason_error_string(errcode))
+    msg = errstr
     if not errstr:
         msg = "unknown error"
     if reason_str and lib_str:
