@@ -71,6 +71,7 @@ if lib.Cryptography_HAS_SSL2:
     PROTOCOL_SSLv2  = 0
 PROTOCOL_SSLv3  = 1
 PROTOCOL_SSLv23 = 2
+PROTOCOL_TLS    = PROTOCOL_SSLv23
 PROTOCOL_TLSv1    = 3
 if lib.Cryptography_HAS_TLSv1_2:
     PROTOCOL_TLSv1 = 3
@@ -96,11 +97,12 @@ for name in error.SSL_AD_NAMES:
 # init open ssl
 lib.SSL_load_error_strings()
 lib.SSL_library_init()
-# TODO threads?
+lib._setup_ssl_threads()
 lib.OpenSSL_add_all_algorithms()
 
 def check_signals():
-    # TODO PyErr_CheckSignal equivalent for pypy?
+    # nothing to do, we are on python level, signals are
+    # checked frequently in the bytecode dispatch loop
     pass
 
 def _socket_timeout(s):
@@ -347,7 +349,6 @@ class _SSLSocket(object):
             peer_cert = ffi.gc(peer_cert, lib.X509_free)
         self.peer_cert = peer_cert
 
-        #PySSL_END_ALLOW_THREADS
         self.handshake_done = 1
         return None
 
@@ -527,12 +528,12 @@ class _SSLSocket(object):
             return None
 
         comp_method = lib.SSL_get_current_compression(self.ssl);
-        if comp_method == ffi.NULL: # or comp_method.type == lib.NID_undef:
+        if comp_method == ffi.NULL: # or lib.SSL_COMP_get_type(comp_method) == lib.NID_undef:
             return None
         short_name = lib.SSL_COMP_get_name(comp_method)
         if short_name == ffi.NULL:
             return None
-        return _fs_decode(_str_from_buf(short_name))
+        return _cstr_decode_fs(short_name)
 
     def version(self):
         if self.ssl == ffi.NULL:
