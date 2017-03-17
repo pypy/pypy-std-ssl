@@ -1,9 +1,9 @@
 # PyPy's SSL module
 
-All of the CFFI code is copied from cryptography, wich patches contributed
+All of the CFFI code is copied from cryptography. Patches were contributed
 back to cryptography. PyPy vendors it's own copy of the cffi backend thus
-it renames the compiled shared object to _pypy_openssl.so (which means
-that cryptography can ship their own cffi backend)
+it renames the compiled shared object to _pypy_openssl.so (cryptography can
+ship their own cffi backend)
 
 # Tests?
 
